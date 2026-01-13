@@ -1,0 +1,51 @@
+#===============================================================================
+# @brief    Kconfig file for SLE UART Bridge Demo
+# Copyright (c) 2024. All rights reserved.
+#===============================================================================
+# Note: ENABLE_DEMO_SAMPLE is defined in parent samples/Kconfig
+
+config SLE_UART_BUS
+    int
+    prompt "UART Bus Number"
+    default 1
+    depends on ENABLE_DEMO_SAMPLE
+    help
+        UART bus number for data transmission.
+        0 = UART0 (may conflict with USB log)
+        1 = UART1 (recommended)
+
+config UART_TXD_PIN
+    int
+    prompt "UART TXD Pin"
+    depends on ENABLE_DEMO_SAMPLE
+    default 17
+
+config UART_RXD_PIN
+    int
+    prompt "UART RXD Pin"
+    depends on ENABLE_DEMO_SAMPLE
+    default 18
+
+choice
+    prompt "SLE Role Selection"
+    default DEMO_SLE_SERVER
+    depends on ENABLE_DEMO_SAMPLE
+    
+    config DEMO_SLE_SERVER
+        bool "Server (Broadcast, wait for connection)"
+        help
+            Device acts as SLE Server, broadcasts and waits for client connection.
+    
+    config DEMO_SLE_CLIENT
+        bool "Client (Scan, connect to server)"
+        help
+            Device acts as SLE Client, scans and connects to server.
+endchoice
+
+config SUPPORT_SLE_PERIPHERAL
+    bool
+    default y if DEMO_SLE_SERVER
+
+config SUPPORT_SLE_CENTRAL
+    bool
+    default y if DEMO_SLE_CLIENT
