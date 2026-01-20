@@ -115,7 +115,7 @@ int demo_uart_init(void)
         .tx_dma_enable = true,
         .tx_int_threshold = UART_FIFO_INT_TX_LEVEL_EQ_0_CHARACTER,
         .rx_dma_enable = false,
-        .rx_int_threshold = UART_FIFO_INT_RX_LEVEL_1_CHARACTER
+        .rx_int_threshold = UART_FIFO_INT_RX_LEVEL_1_2
     };
     
     DEMO_INFO("Initializing UART%d @ %d baud", DEMO_UART_BUS, DEMO_UART_BAUDRATE);

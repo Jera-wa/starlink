@@ -35,7 +35,7 @@ extern "C" {
  * Buffer Configuration (Critical for no-loss)
  *============================================================================*/
 #define DEMO_UART_RX_BUFFER_SIZE    4096     // UART RX ring buffer
-#define DEMO_UART_RX_THRESHOLD      16       // RX回调触发阈值(小值=低延迟)
+#define DEMO_UART_RX_THRESHOLD      32       // RX回调触发阈值(小值=低延迟)
 #define DEMO_UART_TX_BUFFER_SIZE    4096     // UART TX ring buffer
 #define DEMO_SLE_TX_RING_SIZE       (16*1024) // UART->SLE ring buffer (reduced to save memory)
 #define DEMO_SLE_RX_RING_SIZE       (16*1024) // SLE->UART ring buffer (reduced to save memory)
