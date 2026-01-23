@@ -160,7 +160,17 @@ static void print_stats(void)
                   g_demo_stats.loop_stall_ms_max,
                   g_demo_stats.loop_count);
     }
-    
+
+    // [LATENCY] Show SLE RTT statistics
+    if (g_demo_stats.sle_rtt_count > 0) {
+        uint32_t avg_rtt = g_demo_stats.sle_rtt_us_sum / g_demo_stats.sle_rtt_count;
+        DEMO_INFO("[LATENCY] SLE RTT: min=%dus avg=%dus max=%dus (n=%d)",
+                  g_demo_stats.sle_rtt_us_min,
+                  avg_rtt,
+                  g_demo_stats.sle_rtt_us_max,
+                  g_demo_stats.sle_rtt_count);
+    }
+
     DEMO_INFO("[RATE] UART RX: %d KB/s | SLE TX: %d KB/s", uart_rx_kbps, sle_tx_kbps);
 }
 
@@ -205,19 +215,34 @@ static void *demo_bridge_task(const char *arg)
     while (1) {
         uint32_t loop_start = (uint32_t)uapi_systick_get_ms();
         uint32_t work_done = 0;
-        
+        uint32_t t0, t1;
+
         // 1. Bridge UART RX -> SLE TX
+        t0 = (uint32_t)uapi_systick_get_us();
         work_done += bridge_uart_to_sle();
-        
+        t1 = (uint32_t)uapi_systick_get_us();
+        g_demo_stats.time_uart_to_sle_us += (t1 - t0);
+
         // 2. Process SLE TX (send pending data)
+        t0 = (uint32_t)uapi_systick_get_us();
         work_done += demo_sle_tx_process();
-        
+        t1 = (uint32_t)uapi_systick_get_us();
+        g_demo_stats.time_sle_tx_us += (t1 - t0);
+
         // 3. Bridge SLE RX -> UART TX
+        t0 = (uint32_t)uapi_systick_get_us();
         work_done += bridge_sle_to_uart();
-        
+        t1 = (uint32_t)uapi_systick_get_us();
+        g_demo_stats.time_sle_to_uart_us += (t1 - t0);
+
         // 4. Process UART TX (DMA send) - [P1 FIX] Now throttled internally
+        t0 = (uint32_t)uapi_systick_get_us();
         work_done += demo_uart_tx_process();
-        
+        t1 = (uint32_t)uapi_systick_get_us();
+        g_demo_stats.time_uart_tx_us += (t1 - t0);
+
+        g_demo_stats.timing_sample_count++;
+
         // 5. [P2 FIX] Track loop timing for stall detection
         uint32_t loop_elapsed = (uint32_t)uapi_systick_get_ms() - loop_start;
         if (loop_elapsed > g_demo_stats.loop_stall_ms_max) {

@@ -16,6 +16,7 @@
 #include "sle_device_discovery.h"
 #include "sle_ssap_server.h"
 #include "sle_ssap_client.h"
+#include "driver/systick.h"
 
 /*
  * The SLE advertising data type and channel-map constants are defined in
@@ -70,6 +71,15 @@ static volatile uint8_t s_indicate_pending = 0;
 // Client send param
 static ssapc_write_param_t s_client_write_param = {0};
 static sle_addr_t s_remote_addr = {0};
+// [FIX] Track if client is ready to send (handle discovered and MTU exchanged)
+static volatile bool s_client_tx_ready = false;
+// [FIX] SSAP Client ID - required for MTU exchange and service discovery
+static uint8_t s_ssapc_client_id = 0;
+// [LATENCY] Timestamp for RTT measurement (circular buffer for pending writes)
+#define LATENCY_SAMPLE_COUNT 16
+static volatile uint32_t s_tx_timestamp_us[LATENCY_SAMPLE_COUNT];
+static volatile uint8_t s_tx_timestamp_wr_idx = 0;  // Write index (producer)
+static volatile uint8_t s_tx_timestamp_rd_idx = 0;  // Read index (consumer)
 #endif
 
 /*============================================================================
@@ -115,15 +125,48 @@ static void on_connect_state_changed(uint16_t conn_id, const sle_addr_t *addr,
 {
     (void)addr;
     (void)pair_state;
-    
-    DEMO_INFO("Connect state: conn_id=%d, state=%d, disc_reason=0x%x", 
+
+    DEMO_INFO("Connect state: conn_id=%d, state=%d, disc_reason=0x%x",
               conn_id, conn_state, disc_reason);
-    
+
     if (conn_state == SLE_ACB_STATE_CONNECTED) {
         s_conn_id = conn_id;
         s_connected = true;
         DEMO_INFO("SLE Connected!");
-        
+
+        // Set link layer data length for better throughput
+        errcode_t ret = sle_set_data_len(conn_id, 251);
+        DEMO_INFO("Set data_len=251: ret=0x%x", ret);
+
+        // [FIX] Update connection parameters to ensure 2.5ms interval takes effect
+        sle_connection_param_update_t conn_param = {
+            .conn_id = conn_id,
+            .interval_min = DEMO_SLE_CONN_INTV_MIN,  // 0x14 = 2.5ms
+            .interval_max = DEMO_SLE_CONN_INTV_MAX,  // 0x14 = 2.5ms
+            .max_latency = 0,
+            .supervision_timeout = DEMO_SLE_SUPERVISION_TIMEOUT
+        };
+        ret = sle_update_connect_param(&conn_param);
+        DEMO_INFO("Update conn_param (interval=0x%x): ret=0x%x", DEMO_SLE_CONN_INTV_MIN, ret);
+
+        // [THROUGHPUT] Set PHY to 4M for higher speed (both ends must support)
+        sle_set_phy_t phy_param = {
+            .tx_format = SLE_RADIO_FRAME_2,
+            .rx_format = SLE_RADIO_FRAME_2,
+            .tx_phy = SLE_PHY_4M,
+            .rx_phy = SLE_PHY_4M,
+            .tx_pilot_density = SLE_PHY_PILOT_DENSITY_16_TO_1,
+            .rx_pilot_density = SLE_PHY_PILOT_DENSITY_16_TO_1,
+            .g_feedback = 0,
+            .t_feedback = 0,
+        };
+        ret = sle_set_phy_param(conn_id, &phy_param);
+        DEMO_INFO("Set PHY 4M: ret=0x%x", ret);
+
+        // [THROUGHPUT] Set MCS for higher modulation (官方示例使用 MCS 10)
+        ret = sle_set_mcs(conn_id, 10);
+        DEMO_INFO("Set MCS=10: ret=0x%x", ret);
+
 #if IS_SLE_SERVER
         // Server waits for pairing initiated by client
 #else
@@ -135,11 +178,14 @@ static void on_connect_state_changed(uint16_t conn_id, const sle_addr_t *addr,
         s_connected = false;
         s_paired = false;
         DEMO_INFO("SLE Disconnected");
-        
+
 #if IS_SLE_SERVER
         // Restart advertising
         sle_start_announce(DEMO_SLE_ADV_HANDLE);
 #else
+        // [FIX] Clear handle and TX ready flag on disconnect
+        s_client_write_param.handle = 0;
+        s_client_tx_ready = false;
         // Restart scanning
         osal_msleep(100);
         sle_start_seek();
@@ -147,14 +193,29 @@ static void on_connect_state_changed(uint16_t conn_id, const sle_addr_t *addr,
     }
 }
 
+// [DEBUG] Connection parameter update callback - shows actual connection interval
+static void on_connect_param_update(uint16_t conn_id, errcode_t status,
+    const sle_connection_param_update_evt_t *param)
+{
+    if (param == NULL) {
+        DEMO_ERR("Conn param update: null param, status=0x%x", status);
+        return;
+    }
+    // interval 单位是 slot (125us)，转换为 ms: interval * 0.125
+    uint32_t interval_us = param->interval * 125;
+    DEMO_INFO("[CONN PARAM] conn_id=%d, interval=0x%x (%d.%03d ms), latency=%d, timeout=%d0 ms, status=0x%x",
+              conn_id, param->interval, interval_us / 1000, interval_us % 1000,
+              param->latency, param->supervision, status);
+}
+
 static void on_pair_complete(uint16_t conn_id, const sle_addr_t *addr, errcode_t status)
 {
     (void)addr;
     DEMO_INFO("Pair complete: conn_id=%d, status=0x%x", conn_id, status);
-    
+
     if (status == ERRCODE_SLE_SUCCESS) {
         s_paired = true;
-        
+
 #if IS_SLE_SERVER
         // Server sets MTU info
         ssap_exchange_info_t info = { .mtu_size = DEMO_SLE_MTU_SIZE, .version = 1 };
@@ -163,7 +224,11 @@ static void on_pair_complete(uint16_t conn_id, const sle_addr_t *addr, errcode_t
 #else
         // Client initiates MTU exchange
         ssap_exchange_info_t info = { .mtu_size = DEMO_SLE_MTU_SIZE, .version = 1 };
-        ssapc_exchange_info_req(0, conn_id, &info);
+        DEMO_INFO("MTU exchange: client_id=%d, conn_id=%d, mtu=%d",
+                  s_ssapc_client_id, conn_id, info.mtu_size);
+        // NOTE: SDK samples use client_id=0, not the registered ID
+        errcode_t ret = ssapc_exchange_info_req(0, conn_id, &info);
+        DEMO_INFO("MTU exchange request: ret=0x%x", ret);
 #endif
     }
 }
@@ -217,29 +282,55 @@ static void on_server_read_request(uint8_t server_id, uint16_t conn_id,
 static void on_server_write_request(uint8_t server_id, uint16_t conn_id,
     ssaps_req_write_cb_t *write_cb, errcode_t status)
 {
-    (void)server_id;
-    (void)conn_id;
     (void)status;
-    
+
+    // [LATENCY] Record SLE RX timestamp
+    uint32_t rx_time_us = (uint32_t)uapi_systick_get_us();
+
     // [P0 FIX] Check null pointer
     if (write_cb == NULL) return;
-    
+
     // Data received from Client
     if (write_cb->length > 0 && write_cb->value != NULL) {
         uint32_t written = ring_write(&s_sle_rx_ring, write_cb->value, write_cb->length);
         STATS_ADD(sle_rx_bytes, written);
         STATS_INC(sle_rx_frames);
         STATS_SET_HWM(sle_rx_ring_hwm, (uint16_t)ring_data_len(&s_sle_rx_ring));
-        
+
+        // [LATENCY] Log Server RX frame with timestamp
+        DEMO_INFO("[SRV RX] %d bytes @ %d us", write_cb->length, rx_time_us);
+
         // [P1 FIX] Track dropped bytes
         if (written < write_cb->length) {
             STATS_ADD(sle_rx_drop_bytes, write_cb->length - written);
         }
     }
+
+    // [FIX] Send response if client used ssapc_write_req() (expects ACK)
+    // Without this response, client gets err_code:0xEE (write request timeout)
+    DEMO_INFO("[SRV] need_rsp=%d, request_id=%d", write_cb->need_rsp, write_cb->request_id);
+
+    if (write_cb->need_rsp) {
+        ssaps_send_rsp_t rsp = {
+            .request_id = write_cb->request_id,
+            .status = ERRCODE_SLE_SUCCESS,
+            .value_len = 0,
+            .value = NULL
+        };
+
+        uint32_t rsp_start_us = (uint32_t)uapi_systick_get_us();
+        ssaps_send_response(server_id, conn_id, &rsp);
+        uint32_t rsp_end_us = (uint32_t)uapi_systick_get_us();
+
+        // [LATENCY] T3: Server processing time (RX callback → response sent)
+        DEMO_INFO("[SRV RSP] T3=%d us (rsp_call=%d us)",
+                  rsp_end_us - rx_time_us, rsp_end_us - rsp_start_us);
+    }
 }
 
-// [FLOW CONTROL] Indication confirmation callback
-// This is called when Client ACKs our indication
+// [NOTE] Indication confirmation callback
+// This is called when Client ACKs an indication (not notify)
+// Currently using notify which doesn't trigger this callback
 static void on_indicate_cfm(uint8_t server_id, uint16_t conn_id,
     sle_indication_cfm_result_t cfm_result, errcode_t status)
 {
@@ -247,11 +338,9 @@ static void on_indicate_cfm(uint8_t server_id, uint16_t conn_id,
     (void)conn_id;
     (void)status;
     (void)cfm_result;
-    
-    // Decrement pending counter
-    if (s_indicate_pending > 0) {
-        s_indicate_pending--;
-    }
+
+    // Log if this ever gets called (for debugging)
+    DEMO_LOG("[SRV] indicate_cfm received");
 }
 
 static errcode_t server_register_callbacks(void)
@@ -268,18 +357,19 @@ static errcode_t server_register_callbacks(void)
         DEMO_ERR("Announce callback register failed: 0x%x", ret);
         return ret;
     }
-    
+
     // Connection callbacks
     sle_connection_callbacks_t conn_cbks = {
         .connect_state_changed_cb = on_connect_state_changed,
         .pair_complete_cb = on_pair_complete,
+        .connect_param_update_cb = on_connect_param_update,  // [DEBUG] Monitor connection interval
     };
     ret = sle_connection_register_callbacks(&conn_cbks);
     if (ret != ERRCODE_SLE_SUCCESS) {
         DEMO_ERR("Connection callback register failed: 0x%x", ret);
         return ret;
     }
-    
+
     // SSAP server callbacks
     ssaps_callbacks_t ssaps_cbks = {
         .mtu_changed_cb = on_mtu_changed,
@@ -430,28 +520,32 @@ static errcode_t server_start_announce(void)
 
 static errcode_t server_send_notify(const uint8_t *data, uint16_t len)
 {
-    // [FLOW CONTROL] Check if too many indications pending
-    if (s_indicate_pending >= DEMO_MAX_PENDING_INDICATES) {
-        return ERRCODE_SLE_FAIL;  // Backpressure - caller should retry later
-    }
-    
+    // [FIX] Removed pending check - ssaps_notify_indicate sends Notify (no ACK),
+    // so indicate_cfm_cb is never called and pending counter never decrements.
+    // The protocol stack has its own internal flow control.
+
     ssaps_ntf_ind_t param = {0};
-    
+
     uint8_t *buf = s_server_ntf_buf[s_server_ntf_idx];
-    s_server_ntf_idx = (s_server_ntf_idx + 1) % 4;  // Fixed: mod 4 not 32
-    
+    s_server_ntf_idx = (s_server_ntf_idx + 1) % 4;
+
     if (memcpy_s(buf, DEMO_SLE_MTU_SIZE, data, len) != EOK) {
         return ERRCODE_SLE_FAIL;
     }
-    
+
     param.handle = s_property_handle;
     param.type = SSAP_PROPERTY_TYPE_VALUE;
     param.value = buf;
     param.value_len = len;
-    
+
+    uint32_t tx_time_us = (uint32_t)uapi_systick_get_us();
     errcode_t ret = ssaps_notify_indicate(s_server_id, s_conn_id, &param);
+
     if (ret == ERRCODE_SLE_SUCCESS) {
-        s_indicate_pending++;  // [FLOW CONTROL] Track pending
+        DEMO_INFO("[SRV TX] %d bytes @ %d us", len, tx_time_us);
+    } else {
+        // Protocol stack returns error when busy - this is normal flow control
+        DEMO_LOG("[SRV TX] busy: ret=0x%x, len=%d", ret, len);
     }
     return ret;
 }
@@ -559,7 +653,8 @@ static void on_exchange_info(uint8_t client_id, uint16_t conn_id,
         .start_hdl = 1,
         .end_hdl = 0xFFFF,
     };
-    ssapc_find_structure(0, conn_id, &find);
+    errcode_t find_ret = ssapc_find_structure(0, conn_id, &find);
+    DEMO_INFO("Find structure request: ret=0x%x", find_ret);
 }
 
 static void on_find_structure(uint8_t client_id, uint16_t conn_id,
@@ -567,8 +662,12 @@ static void on_find_structure(uint8_t client_id, uint16_t conn_id,
 {
     (void)client_id;
     (void)conn_id;
-    (void)status;
-    DEMO_INFO("Find structure: start=%d, end=%d", service->start_hdl, service->end_hdl);
+    if (service == NULL) {
+        DEMO_ERR("Find structure: null service, status=0x%x", status);
+        return;
+    }
+    DEMO_INFO("Find structure: start=%d, end=%d, status=0x%x",
+              service->start_hdl, service->end_hdl, status);
 }
 
 static void on_find_property(uint8_t client_id, uint16_t conn_id,
@@ -577,15 +676,22 @@ static void on_find_property(uint8_t client_id, uint16_t conn_id,
     (void)client_id;
     (void)conn_id;
     (void)status;
+
+    // [FIX] Check null pointer and valid handle
+    if (property == NULL || property->handle == 0) {
+        DEMO_ERR("Find property: invalid property or handle");
+        return;
+    }
+
     DEMO_INFO("Find property: handle=%d", property->handle);
-    
+
     // Save property handle for data transmission
     s_client_write_param.handle = property->handle;
     s_client_write_param.type = SSAP_PROPERTY_TYPE_VALUE;
-    
-    // NOTE: CCCD subscription removed - was causing panic
-    // Server notifications will be received without explicit subscription
-    // because Server's CCCD default is 0x02 (indication enabled)
+
+    // [FIX] Mark TX as ready - handle discovered
+    s_client_tx_ready = true;
+    DEMO_INFO("Client TX ready: handle=%d, mtu=%d", property->handle, s_mtu_size);
 }
 
 static void on_notification(uint8_t client_id, uint16_t conn_id,
@@ -594,20 +700,28 @@ static void on_notification(uint8_t client_id, uint16_t conn_id,
     (void)client_id;
     (void)conn_id;
     (void)status;
-    
+
+    // [LATENCY] Record RX timestamp
+    uint32_t rx_time_us = (uint32_t)uapi_systick_get_us();
+
     // [P0 FIX] Check null pointer
     if (data == NULL) return;
-    
+
     // Data received from Server
     if (data->data_len > 0 && data->data != NULL) {
         uint32_t written = ring_write(&s_sle_rx_ring, data->data, data->data_len);
         STATS_ADD(sle_rx_bytes, written);
         STATS_INC(sle_rx_frames);
         STATS_SET_HWM(sle_rx_ring_hwm, (uint16_t)ring_data_len(&s_sle_rx_ring));
-        
+
+        // [DEBUG] Log each received frame
+        DEMO_INFO("[CLI RX] %d bytes @ %d us (ring_free=%d)",
+                  data->data_len, rx_time_us, ring_free_len(&s_sle_rx_ring));
+
         // [P1 FIX] Track dropped bytes
         if (written < data->data_len) {
             STATS_ADD(sle_rx_drop_bytes, data->data_len - written);
+            DEMO_ERR("[CLI RX DROP] %d bytes dropped (ring full)", data->data_len - written);
         }
     }
 }
@@ -617,8 +731,39 @@ static void on_write_cfm(uint8_t client_id, uint16_t conn_id,
 {
     (void)client_id;
     (void)conn_id;
-    (void)result;
-    (void)status;
+
+    // [LATENCY] Calculate and print RTT for each frame (FIFO order)
+    uint32_t now_us = (uint32_t)uapi_systick_get_us();
+    uint8_t rd_idx = s_tx_timestamp_rd_idx;
+    uint32_t send_time = s_tx_timestamp_us[rd_idx];
+
+    if (send_time > 0 && now_us >= send_time) {
+        uint32_t rtt_us = now_us - send_time;
+        // Print each RTT
+        DEMO_INFO("[RTT] %d us (%d ms)", rtt_us, rtt_us / 1000);
+
+        // Clear and advance read index
+        s_tx_timestamp_us[rd_idx] = 0;
+        s_tx_timestamp_rd_idx = (rd_idx + 1) % LATENCY_SAMPLE_COUNT;
+
+        // Update stats
+        g_demo_stats.sle_rtt_us_sum += rtt_us;
+        g_demo_stats.sle_rtt_count++;
+
+        if (g_demo_stats.sle_rtt_us_min == 0 || rtt_us < g_demo_stats.sle_rtt_us_min) {
+            g_demo_stats.sle_rtt_us_min = rtt_us;
+        }
+        if (rtt_us > g_demo_stats.sle_rtt_us_max) {
+            g_demo_stats.sle_rtt_us_max = rtt_us;
+        }
+    }
+
+    // [FIX] Log write confirmation for debugging
+    if (status != ERRCODE_SLE_SUCCESS) {
+        DEMO_ERR("Write CFM failed: status=0x%x, handle=%d",
+                 status, result ? result->handle : 0);
+        STATS_INC(sle_tx_fail);
+    }
 }
 
 static errcode_t client_register_callbacks(void)
@@ -637,18 +782,19 @@ static errcode_t client_register_callbacks(void)
         DEMO_ERR("Seek callback register failed: 0x%x", ret);
         return ret;
     }
-    
+
     // Connection callbacks
     sle_connection_callbacks_t conn_cbks = {
         .connect_state_changed_cb = on_connect_state_changed,
         .pair_complete_cb = on_pair_complete,
+        .connect_param_update_cb = on_connect_param_update,  // [DEBUG] Monitor connection interval
     };
     ret = sle_connection_register_callbacks(&conn_cbks);
     if (ret != ERRCODE_SLE_SUCCESS) {
         DEMO_ERR("Connection callback register failed: 0x%x", ret);
         return ret;
     }
-    
+
     // SSAP client callbacks
     ssapc_callbacks_t ssapc_cbks = {
         .exchange_info_cb = on_exchange_info,
@@ -663,7 +809,14 @@ static errcode_t client_register_callbacks(void)
         DEMO_ERR("SSAPC callback register failed: 0x%x", ret);
         return ret;
     }
-    
+    DEMO_INFO("SSAPC callbacks registered");
+
+    // NOTE: SDK samples do NOT call ssapc_register_client(), they use client_id=0 directly
+    // Commenting out to match SDK behavior
+    // sle_uuid_t app_uuid = { .len = 2, .uuid = {0x12, 0x34} };
+    // ret = ssapc_register_client(&app_uuid, &s_ssapc_client_id);
+    // DEMO_INFO("SSAPC register_client: ret=0x%x, id=%d", ret, s_ssapc_client_id);
+
     return ERRCODE_SLE_SUCCESS;
 }
 
@@ -699,8 +852,25 @@ static errcode_t client_send_write(const uint8_t *data, uint16_t len)
 {
     s_client_write_param.data_len = len;
     s_client_write_param.data = (uint8_t *)data;
-    
-    return ssapc_write_req(0, s_conn_id, &s_client_write_param);
+
+    // [LATENCY] Record send timestamp and calculate delay from UART RX
+    uint32_t now_us = (uint32_t)uapi_systick_get_us();
+    uint8_t wr_idx = s_tx_timestamp_wr_idx;
+    s_tx_timestamp_us[wr_idx] = now_us;
+    s_tx_timestamp_wr_idx = (wr_idx + 1) % LATENCY_SAMPLE_COUNT;
+
+    // Print delay from UART RX to SLE TX
+    if (g_demo_stats.uart_rx_timestamp_us > 0) {
+        uint32_t delay_us = now_us - g_demo_stats.uart_rx_timestamp_us;
+        DEMO_INFO("[DELAY] UART_RX->SLE_TX: %d us (%d ms)", delay_us, delay_us / 1000);
+    }
+
+    g_demo_stats.sle_tx_start_us = now_us;
+
+    // [LATENCY FIX] Use write_cmd instead of write_req
+    // write_req waits for server response (blocking ~500ms per packet)
+    // write_cmd is fire-and-forget (non-blocking, much faster)
+    return ssapc_write_cmd(0, s_conn_id, &s_client_write_param);
 }
 
 #endif /* IS_SLE_CLIENT */
@@ -755,7 +925,23 @@ int demo_sle_init(void)
 
 bool demo_sle_is_connected(void)
 {
+#if IS_SLE_SERVER
     return s_connected && s_paired;
+#else
+    // [FIX] Client must also have valid handle before TX
+    // Use handle check instead of separate flag
+    bool ready = s_connected && s_paired && (s_client_write_param.handle != 0);
+    if (s_connected && s_paired && !ready) {
+        // Debug: why not ready (log only once per second to avoid flooding)
+        static uint32_t s_last_log = 0;
+        uint32_t now = (uint32_t)osal_get_jiffies();
+        if (now - s_last_log > 1000) {
+            DEMO_INFO("TX blocked: handle=%d", s_client_write_param.handle);
+            s_last_log = now;
+        }
+    }
+    return ready;
+#endif
 }
 
 ring_buffer_t* demo_sle_get_rx_ring(void)
@@ -832,19 +1018,22 @@ uint32_t demo_sle_tx_process(void)
 #else
         ret = client_send_write(s_sle_tx_buf, (uint16_t)contiguous_len);
 #endif
-        
+
         if (ret == ERRCODE_SLE_SUCCESS) {
             ring_consume(&s_sle_tx_ring, contiguous_len);
             STATS_ADD(sle_tx_bytes, contiguous_len);
             STATS_INC(sle_tx_frames);
             total_sent += contiguous_len;
             batch++;
+            // [DEBUG] Log each frame sent
+            DEMO_LOG("SLE TX frame: %d bytes, batch=%d", contiguous_len, batch);
         } else {
             // [FLOW CONTROL] TX failed - set backoff to slow down
             // This prevents hammering the SLE stack when it's congested
             s_tx_backoff = 2;  // Short backoff - skip 2 iterations before retry
             STATS_INC(sle_tx_fail);
             STATS_INC(sle_tx_busy_cnt);
+            DEMO_LOG("SLE TX fail: ret=0x%x, len=%d, backoff=%d", ret, contiguous_len, s_tx_backoff);
             break;  // SLE busy, retry later
         }
     }

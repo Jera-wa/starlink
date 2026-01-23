@@ -13,6 +13,7 @@
 #include "uart.h"
 #include "dma.h"
 #include "hal_dma.h"
+#include "driver/systick.h"
 
 /*============================================================================
  * Static Variables
@@ -56,14 +57,17 @@ static void uart_rx_callback(const void *buffer, uint16_t length, bool error)
     if (error || length == 0 || buffer == NULL) {
         return;
     }
-    
+
+    // [LATENCY] Record UART RX timestamp
+    g_demo_stats.uart_rx_timestamp_us = (uint32_t)uapi_systick_get_us();
+
     // Write to RX ring buffer
     uint32_t written = ring_write(&s_uart_rx_ring, (const uint8_t *)buffer, length);
-    
+
     STATS_ADD(uart_rx_bytes, written);
     // [P2 FIX] Use correct field name for UART RX direction
     STATS_SET_HWM(uart_rx_ring_hwm, (uint16_t)ring_data_len(&s_uart_rx_ring));
-    
+
     // [P1 FIX] Track drop bytes explicitly
     if (written < length) {
         STATS_ADD(uart_rx_drop_bytes, length - written);
@@ -115,7 +119,7 @@ int demo_uart_init(void)
         .tx_dma_enable = true,
         .tx_int_threshold = UART_FIFO_INT_TX_LEVEL_EQ_0_CHARACTER,
         .rx_dma_enable = false,
-        .rx_int_threshold = UART_FIFO_INT_RX_LEVEL_1_2
+        .rx_int_threshold = UART_FIFO_INT_RX_LEVEL_1_CHARACTER
     };
     
     DEMO_INFO("Initializing UART%d @ %d baud", DEMO_UART_BUS, DEMO_UART_BAUDRATE);

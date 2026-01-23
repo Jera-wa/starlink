@@ -35,7 +35,7 @@ extern "C" {
  * Buffer Configuration (Critical for no-loss)
  *============================================================================*/
 #define DEMO_UART_RX_BUFFER_SIZE    4096     // UART RX ring buffer
-#define DEMO_UART_RX_THRESHOLD      32       // RX回调触发阈值(小值=低延迟)
+#define DEMO_UART_RX_THRESHOLD      16       // RX回调触发阈值(小值=低延迟)
 #define DEMO_UART_TX_BUFFER_SIZE    4096     // UART TX ring buffer
 #define DEMO_SLE_TX_RING_SIZE       (16*1024) // UART->SLE ring buffer (reduced to save memory)
 #define DEMO_SLE_RX_RING_SIZE       (16*1024) // SLE->UART ring buffer (reduced to save memory)
@@ -68,9 +68,8 @@ extern "C" {
 // Supervision timeout: 5000ms = 0x1F4 (unit: 10ms)
 #define DEMO_SLE_SUPERVISION_TIMEOUT 0x1F4
 
-// MTU size for SLE transfer (increased for large frame support)
-// 2200 can carry ~2190 bytes payload, enough for 2151-byte frames in single packet
-#define DEMO_SLE_MTU_SIZE           2200
+// MTU size for SLE transfer
+#define DEMO_SLE_MTU_SIZE           520
 
 // Advertising handle
 #define DEMO_SLE_ADV_HANDLE         1
@@ -116,7 +115,7 @@ extern "C" {
 /*============================================================================
  * Debug Configuration
  *============================================================================*/
-#define DEMO_DEBUG_LOG              0  // Set to 1 to enable verbose logging
+#define DEMO_DEBUG_LOG              1  // Set to 1 to enable verbose logging
 #define DEMO_STATS_INTERVAL_MS      10000  // Print stats every 10s
 
 #if DEMO_DEBUG_LOG
@@ -160,7 +159,24 @@ typedef struct {
     // [P2 FIX] Loop performance monitoring
     volatile uint32_t loop_stall_ms_max;    // Max single loop iteration time
     volatile uint32_t loop_count;           // Total loop iterations
-    
+
+    // [TIMING] Per-stage timing statistics (microseconds)
+    volatile uint32_t time_uart_to_sle_us;      // bridge_uart_to_sle() cumulative time
+    volatile uint32_t time_sle_tx_us;           // demo_sle_tx_process() cumulative time
+    volatile uint32_t time_sle_to_uart_us;      // bridge_sle_to_uart() cumulative time
+    volatile uint32_t time_uart_tx_us;          // demo_uart_tx_process() cumulative time
+    volatile uint32_t timing_sample_count;      // Number of timing samples
+
+    // [LATENCY] SLE round-trip latency (write_req -> write_cfm)
+    volatile uint32_t sle_rtt_us_min;           // Minimum RTT in microseconds
+    volatile uint32_t sle_rtt_us_max;           // Maximum RTT in microseconds
+    volatile uint32_t sle_rtt_us_sum;           // Sum for average calculation
+    volatile uint32_t sle_rtt_count;            // Number of RTT samples
+
+    // [LATENCY] Detailed timing breakdown
+    volatile uint32_t uart_rx_timestamp_us;     // When UART RX received data
+    volatile uint32_t sle_tx_start_us;          // When SLE TX started sending
+
     // Timing
     volatile uint32_t start_tick;
 } demo_stats_t;
