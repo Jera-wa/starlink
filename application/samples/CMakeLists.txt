@@ -22,6 +22,11 @@ endif()
 
 add_subdirectory_if_exist(custom)
 
+# SLE UART Bridge Demo
+if(DEFINED CONFIG_ENABLE_DEMO_SAMPLE)
+    add_subdirectory_if_exist(demo)
+endif()
+
 set(PRIVATE_HEADER
 )
 

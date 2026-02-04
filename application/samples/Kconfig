@@ -39,3 +39,14 @@ if ENABLE_PRODUCTS_SAMPLE
 osource "application/samples/products/Kconfig"
 endif
 
+config ENABLE_DEMO_SAMPLE
+    bool
+    prompt "Enable the Sample of demo."
+    default n
+    depends on SAMPLE_ENABLE
+    help
+        This option means enable the sample of demo.
+
+if ENABLE_DEMO_SAMPLE
+osource "application/samples/demo/Kconfig"
+endif
