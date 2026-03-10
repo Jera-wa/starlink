@@ -1,13 +1,10 @@
 /**
  * @file demo_uart.c
- * @brief UART DMA+Interrupt Implementation
- * 
- * Uses DMA for TX (non-blocking) and RX callback + ring buffer.
+ * @brief UART DMA TX and logical-frame RX implementation.
  */
 
 #include "demo_uart.h"
 #include "demo_config.h"
-#include "demo_sle.h"  // [LOW-LATENCY] For direct SLE TX
 #include "securec.h"
 #include "soc_osal.h"
 #include "pinctrl.h"
@@ -16,27 +13,23 @@
 #include "hal_dma.h"
 #include "driver/systick.h"
 
-/*============================================================================
- * Static Variables
- *============================================================================*/
+typedef struct {
+    uint8_t buffer[DEMO_LOGICAL_FRAME_MAX_SIZE];
+    uint16_t used;
+    uint16_t expected_len;
+    uint32_t first_byte_timestamp_us;
+} demo_uart_frame_parser_t;
 
-// RX Ring Buffer: UART RX ISR -> Main Loop
-static uint8_t s_uart_rx_ring_buf[DEMO_SLE_TX_RING_SIZE];
-static ring_buffer_t s_uart_rx_ring;
+static demo_frame_queue_t s_uart_rx_frames;
+static demo_frame_queue_t s_uart_tx_frames;
+static demo_uart_frame_parser_t s_uart_rx_parser;
 
-// TX Ring Buffer: Main Loop -> UART DMA
-static uint8_t s_uart_tx_ring_buf[DEMO_SLE_RX_RING_SIZE];
-static ring_buffer_t s_uart_tx_ring;
-
-// DMA TX buffer (ping-pong)
 static uint8_t s_dma_tx_buf[DEMO_TX_BUFFER_COUNT][DEMO_DMA_CHUNK_SIZE];
 static volatile uint8_t s_dma_tx_idx = 0;
 static volatile bool s_dma_tx_busy = false;
-
-// UART RX buffer for SDK callback
 static uint8_t s_uart_rx_buf[DEMO_UART_RX_BUFFER_SIZE];
+static uint16_t s_next_uart_frame_id = 1;
 
-// DMA config
 static uart_write_dma_config_t s_dma_cfg = {
     .src_width = HAL_DMA_TRANSFER_WIDTH_8,
     .dest_width = HAL_DMA_TRANSFER_WIDTH_8,
@@ -49,37 +42,163 @@ static uart_buffer_config_t s_uart_buf_cfg = {
     .rx_buffer_size = DEMO_UART_RX_BUFFER_SIZE
 };
 
-/*============================================================================
- * UART RX Callback (ISR Context)
- *============================================================================*/
+static uint16_t demo_uart_next_frame_id(void)
+{
+    uint16_t frame_id = s_next_uart_frame_id++;
+    if (frame_id == 0) {
+        frame_id = s_next_uart_frame_id++;
+    }
+    return frame_id;
+}
+
+static void demo_uart_parser_drop_prefix(demo_uart_frame_parser_t *parser, uint16_t count)
+{
+    if (parser == NULL || count == 0) {
+        return;
+    }
+
+    if (count >= parser->used) {
+        parser->used = 0;
+        parser->expected_len = 0;
+        parser->first_byte_timestamp_us = 0;
+        return;
+    }
+
+    if (memmove_s(parser->buffer, sizeof(parser->buffer), parser->buffer + count,
+        parser->used - count) != EOK) {
+        parser->used = 0;
+        parser->expected_len = 0;
+        parser->first_byte_timestamp_us = 0;
+        return;
+    }
+
+    parser->used = (uint16_t)(parser->used - count);
+    if (parser->used < DEMO_LOGICAL_FRAME_HEADER_SIZE) {
+        parser->expected_len = 0;
+    }
+}
+
+static void demo_uart_queue_ingress_frame(demo_uart_frame_parser_t *parser)
+{
+    uint16_t frame_id;
+    uint8_t queued;
+
+    if (parser == NULL || parser->expected_len == 0 || parser->used < parser->expected_len) {
+        return;
+    }
+
+    frame_id = demo_uart_next_frame_id();
+    queued = demo_frame_queue_push(&s_uart_rx_frames, parser->buffer, parser->expected_len,
+        frame_id, parser->first_byte_timestamp_us);
+    if (!queued) {
+        STATS_INC(uart_rx_drop_frames);
+        STATS_ADD(uart_rx_drop_bytes, parser->expected_len);
+        DEMO_ERR("UART RX frame queue full: id=%u len=%u", frame_id, parser->expected_len);
+    } else {
+        STATS_INC(uart_rx_frames);
+        STATS_SET_HWM(uart_rx_ring_hwm, demo_frame_queue_count(&s_uart_rx_frames));
+        DEMO_LOG("UART RX frame queued: id=%u len=%u q=%u",
+            frame_id, parser->expected_len, demo_frame_queue_count(&s_uart_rx_frames));
+        osal_event_write(&g_bridge_event, DEMO_EVENT_UART_RX);
+    }
+
+    demo_uart_parser_drop_prefix(parser, parser->expected_len);
+    parser->expected_len = 0;
+}
+
+static void demo_uart_parser_process(demo_uart_frame_parser_t *parser, uint32_t timestamp_us)
+{
+    uint16_t expected_len;
+
+    if (parser == NULL) {
+        return;
+    }
+
+    while (parser->used > 0) {
+        if (parser->used >= 2 && !demo_logical_frame_header_valid(parser->buffer)) {
+            STATS_INC(uart_rx_invalid_bytes);
+            demo_uart_parser_drop_prefix(parser, 1);
+            continue;
+        }
+
+        if (parser->used < DEMO_LOGICAL_FRAME_HEADER_SIZE) {
+            break;
+        }
+
+        expected_len = demo_logical_frame_total_len(parser->buffer);
+        if (expected_len < DEMO_LOGICAL_FRAME_HEADER_SIZE ||
+            expected_len > DEMO_LOGICAL_FRAME_MAX_SIZE) {
+            STATS_INC(uart_rx_oversize_frames);
+            STATS_INC(uart_rx_invalid_bytes);
+            DEMO_ERR("UART RX frame length invalid: total=%u", expected_len);
+            demo_uart_parser_drop_prefix(parser, 1);
+            continue;
+        }
+
+        parser->expected_len = expected_len;
+        if (parser->used < expected_len) {
+            break;
+        }
+
+        demo_uart_queue_ingress_frame(parser);
+        if (parser->used > 0) {
+            parser->first_byte_timestamp_us = timestamp_us;
+        }
+    }
+}
+
+static void demo_uart_parser_feed(const uint8_t *buffer, uint16_t length, uint32_t timestamp_us)
+{
+    uint16_t copy_len;
+    uint16_t space_left;
+
+    while (length > 0) {
+        if (s_uart_rx_parser.used == 0) {
+            s_uart_rx_parser.first_byte_timestamp_us = timestamp_us;
+        }
+
+        space_left = (uint16_t)(DEMO_LOGICAL_FRAME_MAX_SIZE - s_uart_rx_parser.used);
+        if (space_left == 0) {
+            STATS_INC(uart_rx_oversize_frames);
+            STATS_ADD(uart_rx_drop_bytes, length);
+            DEMO_ERR("UART RX parser overflow, resetting state");
+            s_uart_rx_parser.used = 0;
+            s_uart_rx_parser.expected_len = 0;
+            s_uart_rx_parser.first_byte_timestamp_us = 0;
+            return;
+        }
+
+        copy_len = (length < space_left) ? length : space_left;
+        if (memcpy_s(s_uart_rx_parser.buffer + s_uart_rx_parser.used, space_left, buffer,
+            copy_len) != EOK) {
+            return;
+        }
+
+        s_uart_rx_parser.used = (uint16_t)(s_uart_rx_parser.used + copy_len);
+        buffer += copy_len;
+        length = (uint16_t)(length - copy_len);
+
+        demo_uart_parser_process(&s_uart_rx_parser, timestamp_us);
+        if (s_uart_rx_parser.used > 0 && s_uart_rx_parser.first_byte_timestamp_us == 0) {
+            s_uart_rx_parser.first_byte_timestamp_us = timestamp_us;
+        }
+    }
+}
 
 static void uart_rx_callback(const void *buffer, uint16_t length, bool error)
 {
+    uint32_t rx_time_us;
+
     if (error || length == 0 || buffer == NULL) {
         return;
     }
 
-    // [LATENCY] Record UART RX timestamp
-    g_demo_stats.uart_rx_timestamp_us = (uint32_t)uapi_systick_get_us();
+    rx_time_us = (uint32_t)uapi_systick_get_us();
+    g_demo_stats.uart_rx_timestamp_us = rx_time_us;
+    STATS_ADD(uart_rx_bytes, length);
 
-    // Write to RX ring buffer
-    uint32_t written = ring_write(&s_uart_rx_ring, (const uint8_t *)buffer, length);
-
-    STATS_ADD(uart_rx_bytes, written);
-    STATS_SET_HWM(uart_rx_ring_hwm, (uint16_t)ring_data_len(&s_uart_rx_ring));
-
-    if (written < length) {
-        STATS_ADD(uart_rx_drop_bytes, length - written);
-        STATS_INC(ring_overflow);
-    }
-    
-    // [EVENT-DRIVEN] Signal main task that UART data is available
-    osal_event_write(&g_bridge_event, DEMO_EVENT_UART_RX);
+    demo_uart_parser_feed((const uint8_t *)buffer, length, rx_time_us);
 }
-
-/*============================================================================
- * Initialization
- *============================================================================*/
 
 static void uart_init_pin(void)
 {
@@ -94,74 +213,58 @@ static void uart_init_pin(void)
 int demo_uart_init(void)
 {
     errcode_t ret;
-    
-    // Initialize ring buffers
-    ring_init(&s_uart_rx_ring, s_uart_rx_ring_buf, sizeof(s_uart_rx_ring_buf));
-    ring_init(&s_uart_tx_ring, s_uart_tx_ring_buf, sizeof(s_uart_tx_ring_buf));
-    
-    // Configure pins
-    uart_init_pin();
-    
-    // UART config
     uart_attr_t attr = {
         .baud_rate = DEMO_UART_BAUDRATE,
         .data_bits = UART_DATA_BIT_8,
         .stop_bits = UART_STOP_BIT_1,
         .parity = UART_PARITY_NONE
     };
-    
     uart_pin_config_t pin_cfg = {
         .tx_pin = DEMO_UART_TX_PIN,
         .rx_pin = DEMO_UART_RX_PIN,
         .cts_pin = PIN_NONE,
         .rts_pin = PIN_NONE
     };
-    
     uart_extra_attr_t ext_cfg = {
         .tx_dma_enable = true,
         .tx_int_threshold = UART_FIFO_INT_TX_LEVEL_EQ_0_CHARACTER,
         .rx_dma_enable = false,
         .rx_int_threshold = UART_FIFO_INT_RX_LEVEL_1_CHARACTER
     };
-    
+
+    demo_frame_queue_init(&s_uart_rx_frames);
+    demo_frame_queue_init(&s_uart_tx_frames);
+    (void)memset_s(&s_uart_rx_parser, sizeof(s_uart_rx_parser), 0, sizeof(s_uart_rx_parser));
+
+    uart_init_pin();
+
     DEMO_INFO("Initializing UART%d @ %d baud", DEMO_UART_BUS, DEMO_UART_BAUDRATE);
-    
-    // [P2 FIX] Stricter DMA init error handling
     ret = uapi_dma_init();
     if (ret != ERRCODE_SUCC) {
         DEMO_INFO("DMA init: 0x%x (may be already initialized)", ret);
-        // Continue - DMA may already be initialized by other components
     }
-    
+
     ret = uapi_dma_open();
     if (ret != ERRCODE_SUCC) {
         DEMO_INFO("DMA open: 0x%x (may be already open)", ret);
-        // Continue - DMA may already be open
     }
-    
-    // Deinit first to reconfigure
+
     (void)uapi_uart_deinit(DEMO_UART_BUS);
-    
-    // Initialize UART
     ret = uapi_uart_init(DEMO_UART_BUS, &pin_cfg, &attr, &ext_cfg, &s_uart_buf_cfg);
     if (ret != ERRCODE_SUCC) {
         DEMO_ERR("UART init failed: 0x%x", ret);
         return -1;
     }
-    
-    // Register RX callback
-    ret = uapi_uart_register_rx_callback(
-        DEMO_UART_BUS,
+
+    ret = uapi_uart_register_rx_callback(DEMO_UART_BUS,
         UART_RX_CONDITION_FULL_OR_SUFFICIENT_DATA_OR_IDLE,
-        DEMO_UART_RX_THRESHOLD,  // 小阈值快速回调
-        uart_rx_callback
-    );
+        DEMO_UART_RX_THRESHOLD, uart_rx_callback);
     if (ret != ERRCODE_SUCC) {
         DEMO_ERR("UART RX callback register failed: 0x%x", ret);
         return -1;
     }
-    
-    DEMO_INFO("UART init OK (DMA TX, INT RX)");
+
+    DEMO_INFO("UART init OK (DMA TX, frame-aware RX)");
     return 0;
 }
 
@@ -171,23 +274,30 @@ void demo_uart_deinit(void)
     uapi_uart_deinit(DEMO_UART_BUS);
 }
 
-/*============================================================================
- * Ring Buffer Accessors
- *============================================================================*/
-
-ring_buffer_t* demo_uart_get_rx_ring(void)
+const demo_frame_slot_t *demo_uart_rx_frame_peek(void)
 {
-    return &s_uart_rx_ring;
+    return demo_frame_queue_peek(&s_uart_rx_frames);
 }
 
-ring_buffer_t* demo_uart_get_tx_ring(void)
+void demo_uart_rx_frame_consume(void)
 {
-    return &s_uart_tx_ring;
+    demo_frame_queue_consume(&s_uart_rx_frames);
 }
 
-/*============================================================================
- * TX Processing
- *============================================================================*/
+bool demo_uart_queue_tx_frame(const uint8_t *data, uint16_t len, uint16_t frame_id,
+    uint32_t enqueue_timestamp_us)
+{
+    bool queued = demo_frame_queue_push(&s_uart_tx_frames, data, len, frame_id,
+        enqueue_timestamp_us);
+    if (!queued) {
+        STATS_INC(uart_tx_drop_frames);
+        DEMO_ERR("UART TX frame queue full: id=%u len=%u", frame_id, len);
+        return false;
+    }
+
+    STATS_SET_HWM(uart_tx_ring_hwm, demo_frame_queue_count(&s_uart_tx_frames));
+    return true;
+}
 
 bool demo_uart_tx_is_busy(void)
 {
@@ -196,92 +306,79 @@ bool demo_uart_tx_is_busy(void)
 
 uint32_t demo_uart_tx_send(const uint8_t *data, uint32_t len)
 {
-    if (len == 0 || data == NULL) {
+    uint8_t *dma_buf;
+    int32_t ret;
+
+    if (data == NULL || len == 0 || len > DEMO_DMA_CHUNK_SIZE) {
         return 0;
     }
-    
-    // Cap to chunk size
-    if (len > DEMO_DMA_CHUNK_SIZE) {
-        len = DEMO_DMA_CHUNK_SIZE;
-    }
-    
-    // Copy to DMA buffer
-    uint8_t *dma_buf = s_dma_tx_buf[s_dma_tx_idx];
+
+    dma_buf = s_dma_tx_buf[s_dma_tx_idx];
     if (memcpy_s(dma_buf, DEMO_DMA_CHUNK_SIZE, data, len) != EOK) {
         return 0;
     }
-    
-    // Send via DMA (blocking)
-    int32_t ret = uapi_uart_write_by_dma(DEMO_UART_BUS, dma_buf, len, &s_dma_cfg);
+
+#if defined(osal_dcache_region_wb)
+    osal_dcache_region_wb(dma_buf, len);
+#endif
+
+    s_dma_tx_busy = true;
+    ret = uapi_uart_write_by_dma(DEMO_UART_BUS, dma_buf, len, &s_dma_cfg);
+    s_dma_tx_busy = false;
     if (ret < 0) {
         DEMO_ERR("DMA write failed: %d", ret);
         return 0;
     }
-    
-    // Update stats and buffer index
+
     STATS_ADD(uart_tx_bytes, len);
-    s_dma_tx_idx = (s_dma_tx_idx + 1) % DEMO_TX_BUFFER_COUNT;
-    
+    s_dma_tx_idx = (uint8_t)((s_dma_tx_idx + 1U) % DEMO_TX_BUFFER_COUNT);
     return len;
 }
 
-/**
- * UART TX processing - optimized for throughput.
- * Increase batch count and chunk size for faster transmission.
- */
-#define DEMO_MAX_DMA_PER_LOOP  16  // Increased for faster SLE->UART output
+int32_t demo_uart_tx_direct(const uint8_t *data, uint16_t len)
+{
+    return (int32_t)demo_uart_tx_send(data, len);
+}
+
+#define DEMO_MAX_DMA_PER_LOOP  4
 
 uint32_t demo_uart_tx_process(void)
 {
+    const demo_frame_slot_t *slot;
     uint32_t total_sent = 0;
     uint32_t batch = 0;
-    
-    // [P1 FIX] Limit DMA calls per loop to prevent starving other directions
-    while (!ring_is_empty(&s_uart_tx_ring) && batch < DEMO_MAX_DMA_PER_LOOP) {
-        uint8_t *ptr;
-        uint32_t contiguous_len;
-        
-        // Get contiguous data pointer
-        ring_peek_contiguous(&s_uart_tx_ring, &ptr, &contiguous_len);
-        
-        if (contiguous_len == 0) {
+
+    while (batch < DEMO_MAX_DMA_PER_LOOP) {
+        uint32_t now_us;
+        uint32_t frame_delay_us = 0;
+        uint32_t sent;
+
+        slot = demo_frame_queue_peek(&s_uart_tx_frames);
+        if (slot == NULL) {
             break;
         }
-        
-        // Chunk size for DMA transfer - larger = faster but more blocking
-        uint32_t max_chunk = 2048;  // Increased from 1024 for faster TX
-        if (contiguous_len > max_chunk) {
-            contiguous_len = max_chunk;
-        }
-        
-        // Copy to DMA buffer and send
-        uint8_t *dma_buf = s_dma_tx_buf[s_dma_tx_idx];
-        if (memcpy_s(dma_buf, DEMO_DMA_CHUNK_SIZE, ptr, contiguous_len) != EOK) {
+
+        sent = demo_uart_tx_send(slot->data, slot->len);
+        if (sent != slot->len) {
+            STATS_INC(uart_tx_drop_frames);
             break;
         }
-        
-        // [P1 FIX] DCache writeback before DMA - ensures data coherency if DCache is enabled
-        // If DCache is disabled, this is a no-op
-#if defined(osal_dcache_region_wb)
-        osal_dcache_region_wb(dma_buf, contiguous_len);
-#endif
-        
-        int32_t ret = uapi_uart_write_by_dma(DEMO_UART_BUS, dma_buf, contiguous_len, &s_dma_cfg);
-        if (ret < 0) {
-            break;
+
+        now_us = (uint32_t)uapi_systick_get_us();
+        if (slot->enqueue_timestamp_us > 0 && now_us >= slot->enqueue_timestamp_us) {
+            frame_delay_us = now_us - slot->enqueue_timestamp_us;
+            STATS_UPDATE_RANGE(frame_rx_delay_us_min, frame_rx_delay_us_max,
+                frame_rx_delay_us_sum, frame_rx_delay_count, frame_delay_us);
         }
-        
-        // Consume from ring buffer
-        ring_consume(&s_uart_tx_ring, contiguous_len);
-        
-        STATS_ADD(uart_tx_bytes, contiguous_len);
-        // [P2 FIX] Track UART TX ring water mark
-        STATS_SET_HWM(uart_tx_ring_hwm, (uint16_t)ring_data_len(&s_uart_tx_ring));
-        
-        total_sent += contiguous_len;
-        s_dma_tx_idx = (s_dma_tx_idx + 1) % DEMO_TX_BUFFER_COUNT;
+
+        STATS_INC(uart_tx_frames);
+        DEMO_LOG("UART TX frame complete: id=%u len=%u delivery=%u us",
+            slot->frame_id, slot->len, frame_delay_us);
+
+        demo_frame_queue_consume(&s_uart_tx_frames);
+        total_sent += sent;
         batch++;
     }
-    
+
     return total_sent;
 }
