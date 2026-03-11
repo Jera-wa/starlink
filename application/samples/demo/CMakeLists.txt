@@ -10,6 +10,7 @@ set(SOURCES_LIST
     ${CMAKE_CURRENT_SOURCE_DIR}/demo.c
     ${CMAKE_CURRENT_SOURCE_DIR}/demo_uart.c
     ${CMAKE_CURRENT_SOURCE_DIR}/demo_sle.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/demo_transport.c
 )
 
 set(HEADER_LIST

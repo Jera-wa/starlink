@@ -38,3 +38,29 @@ The demo bridge SHALL reject or clamp connection-related configuration values th
 - **WHEN** the configured connection interval falls below the documented legal range
 - **THEN** the demo SHALL reject or clamp that value before requesting the update
 - **THEN** the logs SHALL show the effective requested value and the negotiated value returned by the stack
+
+### Requirement: Server-to-client transport is reliable up to peer SLE reassembly
+The demo bridge SHALL NOT consider a logical frame delivered merely because a local send API returned success. A frame SHALL be considered delivered only after the peer confirms successful full-frame reassembly.
+
+#### Scenario: Fragment indication succeeds but frame is not yet acknowledged
+- **WHEN** one or more internal wireless fragments for a logical frame have been accepted locally for transmission
+- **THEN** the sender SHALL retain the logical frame in its reliable transmit state
+- **THEN** the sender SHALL NOT release that frame until a peer acknowledgement for the completed logical frame is received
+
+#### Scenario: Peer fully reassembles a frame
+- **WHEN** the receiver completes reassembly of a logical frame
+- **THEN** it SHALL emit a frame acknowledgement back to the sender
+- **THEN** the sender SHALL treat receipt of that acknowledgement as the success point for SLE delivery
+
+### Requirement: Transport retries and duplicate suppression are explicit
+The demo bridge SHALL retry incomplete server-to-client delivery after indication or acknowledgement failure, and SHALL suppress duplicate logical frame delivery at the receiver.
+
+#### Scenario: Indication confirm or frame acknowledgement is missing
+- **WHEN** the sender does not receive the expected fragment confirm or frame acknowledgement within the configured timeout
+- **THEN** it SHALL retry the logical frame according to the configured retry budget
+- **THEN** it SHALL log retry and hard-failure events instead of silently dropping the frame
+
+#### Scenario: Receiver observes a retransmitted completed frame
+- **WHEN** the receiver gets a duplicate logical frame that it has already fully reassembled and acknowledged
+- **THEN** it SHALL NOT enqueue that logical frame to UART a second time
+- **THEN** it SHALL re-send the frame acknowledgement so the sender can converge

@@ -26,11 +26,16 @@ extern "C" {
 
 #define DEMO_SLE_FRAG_MAGIC0           0xD5
 #define DEMO_SLE_FRAG_MAGIC1           0x5E
+#define DEMO_SLE_PKT_TYPE_DATA         0x01
+#define DEMO_SLE_PKT_TYPE_ACK          0x02
+#define DEMO_SLE_PKT_TYPE_RESET        0x03
 
 typedef struct {
     uint16_t len;
     uint16_t frame_id;
     uint32_t enqueue_timestamp_us;
+    uint32_t ready_timestamp_us;
+    uint32_t stage_duration_us;
     uint8_t data[DEMO_LOGICAL_FRAME_MAX_SIZE];
 } demo_frame_slot_t;
 
@@ -41,6 +46,8 @@ typedef struct {
 } demo_frame_queue_t;
 
 typedef struct {
+    uint8_t type;
+    uint8_t flags;
     uint16_t frame_id;
     uint16_t total_len;
     uint16_t frag_offset;
@@ -72,7 +79,8 @@ static inline uint8_t demo_frame_queue_count(const demo_frame_queue_t *queue)
 }
 
 static inline bool demo_frame_queue_push(demo_frame_queue_t *queue, const uint8_t *data,
-    uint16_t len, uint16_t frame_id, uint32_t enqueue_timestamp_us)
+    uint16_t len, uint16_t frame_id, uint32_t enqueue_timestamp_us, uint32_t ready_timestamp_us,
+    uint32_t stage_duration_us)
 {
     uint8_t next_tail;
     demo_frame_slot_t *slot;
@@ -94,6 +102,8 @@ static inline bool demo_frame_queue_push(demo_frame_queue_t *queue, const uint8_
     slot->len = len;
     slot->frame_id = frame_id;
     slot->enqueue_timestamp_us = enqueue_timestamp_us;
+    slot->ready_timestamp_us = ready_timestamp_us;
+    slot->stage_duration_us = stage_duration_us;
     queue->tail = next_tail;
     return true;
 }
@@ -158,14 +168,16 @@ static inline void demo_sle_frag_encode(uint8_t *dst, const demo_sle_frag_hdr_t 
 
     dst[0] = DEMO_SLE_FRAG_MAGIC0;
     dst[1] = DEMO_SLE_FRAG_MAGIC1;
-    dst[2] = (uint8_t)(hdr->frame_id >> 8);
-    dst[3] = (uint8_t)(hdr->frame_id & 0xFFU);
-    dst[4] = (uint8_t)(hdr->total_len >> 8);
-    dst[5] = (uint8_t)(hdr->total_len & 0xFFU);
-    dst[6] = (uint8_t)(hdr->frag_offset >> 8);
-    dst[7] = (uint8_t)(hdr->frag_offset & 0xFFU);
-    dst[8] = hdr->frag_idx;
-    dst[9] = hdr->frag_count;
+    dst[2] = hdr->type;
+    dst[3] = hdr->flags;
+    dst[4] = (uint8_t)(hdr->frame_id >> 8);
+    dst[5] = (uint8_t)(hdr->frame_id & 0xFFU);
+    dst[6] = (uint8_t)(hdr->total_len >> 8);
+    dst[7] = (uint8_t)(hdr->total_len & 0xFFU);
+    dst[8] = (uint8_t)(hdr->frag_offset >> 8);
+    dst[9] = (uint8_t)(hdr->frag_offset & 0xFFU);
+    dst[10] = hdr->frag_idx;
+    dst[11] = hdr->frag_count;
 }
 
 static inline bool demo_sle_frag_decode(const uint8_t *src, uint16_t len, demo_sle_frag_hdr_t *hdr)
@@ -178,11 +190,13 @@ static inline bool demo_sle_frag_decode(const uint8_t *src, uint16_t len, demo_s
         return false;
     }
 
-    hdr->frame_id = (uint16_t)(((uint16_t)src[2] << 8) | src[3]);
-    hdr->total_len = (uint16_t)(((uint16_t)src[4] << 8) | src[5]);
-    hdr->frag_offset = (uint16_t)(((uint16_t)src[6] << 8) | src[7]);
-    hdr->frag_idx = src[8];
-    hdr->frag_count = src[9];
+    hdr->type = src[2];
+    hdr->flags = src[3];
+    hdr->frame_id = (uint16_t)(((uint16_t)src[4] << 8) | src[5]);
+    hdr->total_len = (uint16_t)(((uint16_t)src[6] << 8) | src[7]);
+    hdr->frag_offset = (uint16_t)(((uint16_t)src[8] << 8) | src[9]);
+    hdr->frag_idx = src[10];
+    hdr->frag_count = src[11];
     return true;
 }
 

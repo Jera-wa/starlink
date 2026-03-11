@@ -65,7 +65,13 @@ extern "C" {
 
 #define DEMO_SLE_MTU_SIZE 1100
 #define DEMO_SLE_DATA_LEN_TARGET DEMO_SLE_MTU_SIZE
-#define DEMO_SLE_FRAG_HEADER_SIZE 10
+#define DEMO_SLE_FRAG_HEADER_SIZE 12
+/* Set to 0 for low-latency experiments, 1 for peer-reassembly ACK semantics. */
+#define DEMO_SLE_FRAME_ACK_ENABLE 0
+#define DEMO_SLE_INDICATE_TIMEOUT_MS 20
+#define DEMO_SLE_FRAME_ACK_TIMEOUT_MS 30
+#define DEMO_SLE_ACK_TIMEOUT_MS 20
+#define DEMO_SLE_MAX_RETRIES 3
 #define DEMO_SLE_LOW_LATENCY_ENABLE 1
 #define DEMO_SLE_LOW_LATENCY_RATE 1 /* 500 Hz target, about 2 ms */
 
@@ -117,6 +123,8 @@ typedef struct {
   volatile uint32_t ring_overflow;
   volatile uint32_t uart_rx_drop_frames;
   volatile uint32_t uart_tx_drop_frames;
+  volatile uint32_t uart_tx_fast_path_hits;
+  volatile uint32_t uart_tx_fast_path_misses;
   volatile uint32_t uart_rx_oversize_frames;
   volatile uint32_t sle_reassembly_drop_frames;
   volatile uint32_t sle_reassembly_reset_cnt;
@@ -124,6 +132,13 @@ typedef struct {
 
   volatile uint32_t sle_tx_fail;
   volatile uint32_t sle_tx_busy_cnt;
+  volatile uint32_t sle_ack_sent;
+  volatile uint32_t sle_ack_received;
+  volatile uint32_t sle_tx_retry_frames;
+  volatile uint32_t sle_tx_hard_fail;
+  volatile uint32_t sle_rx_duplicate_frames;
+  volatile uint32_t sle_indicate_timeout_cnt;
+  volatile uint32_t sle_frame_ack_timeout_cnt;
 
   volatile uint16_t uart_rx_ring_hwm;
   volatile uint16_t uart_tx_ring_hwm;
@@ -167,6 +182,21 @@ typedef struct {
   volatile uint32_t frame_rx_delay_us_sum;
   volatile uint32_t frame_rx_delay_count;
 
+  volatile uint32_t sle_reassembly_us_min;
+  volatile uint32_t sle_reassembly_us_max;
+  volatile uint32_t sle_reassembly_us_sum;
+  volatile uint32_t sle_reassembly_count;
+
+  volatile uint32_t uart_queue_wait_us_min;
+  volatile uint32_t uart_queue_wait_us_max;
+  volatile uint32_t uart_queue_wait_us_sum;
+  volatile uint32_t uart_queue_wait_count;
+
+  volatile uint32_t uart_submit_us_min;
+  volatile uint32_t uart_submit_us_max;
+  volatile uint32_t uart_submit_us_sum;
+  volatile uint32_t uart_submit_count;
+
   volatile uint32_t intra_frame_gap_us_min;
   volatile uint32_t intra_frame_gap_us_max;
   volatile uint32_t intra_frame_gap_us_sum;
@@ -200,11 +230,18 @@ extern demo_stats_t g_demo_stats;
   } while (0)
 
 /*============================================================================
- * Hybrid Role Macros
+ * Role Check Macros
  *============================================================================*/
-#define DEMO_SLE_HYBRID_MODE 1
-#define IS_SLE_SERVER 1
-#define IS_SLE_CLIENT 1
+#if defined(CONFIG_DEMO_SLE_SERVER)
+#define IS_SLE_SERVER   1
+#define IS_SLE_CLIENT   0
+#elif defined(CONFIG_DEMO_SLE_CLIENT)
+#define IS_SLE_SERVER   0
+#define IS_SLE_CLIENT   1
+#else
+#define IS_SLE_SERVER   1
+#define IS_SLE_CLIENT   0
+#endif
 
 #ifdef __cplusplus
 }

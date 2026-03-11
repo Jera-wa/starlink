@@ -38,6 +38,12 @@ Alternatives considered:
 - Expose raw SLE fragment boundaries to UART: matches the current failure mode and keeps random intra-frame gaps visible to the application.
 - Switch to indication-only transport: improves acknowledgement semantics but does not by itself restore end-to-end frame boundaries.
 
+2a. The bridge will treat SLE delivery as complete only after the peer confirms full-frame reassembly.
+Rationale: The current notify-only path can still lose a fragment silently even after the sender has advanced its state. A frame-level acknowledgement after successful peer reassembly provides a concrete success point without extending the success boundary all the way to remote UART DMA completion.
+Alternatives considered:
+- Keep notify and rely only on local API return codes: preserves lower latency but cannot prevent silent frame loss.
+- Move business traffic back to `client -> server write_req`: improves reliability but abandons the chosen unified `server -> client` hybrid data path.
+
 3. UART ingress will use an explicit frame extractor instead of assuming callback boundaries are frame boundaries.
 Rationale: The demo currently receives framed application traffic, but UART callbacks are triggered by threshold and idle conditions. A frame extractor lets the bridge identify complete logical frames before enqueueing them for transport.
 Alternatives considered:
@@ -48,6 +54,12 @@ Alternatives considered:
 Rationale: The capture shows that a complete logical frame can arrive at the receiver and still be emitted as multiple UART bursts. One DMA submission per complete reassembled frame removes that leak and gives clearer timing diagnostics.
 Alternatives considered:
 - Continue draining the UART TX ring by contiguous slices: keeps scheduler-driven burst fragmentation in the user-visible output path.
+
+4a. Business fragments will use an indication-confirmed transport path with a separate frame acknowledgement control message.
+Rationale: The user-selected success boundary for the next phase is "peer SLE complete reassembly", not "remote UART already transmitted". Indication confirm gives per-fragment protocol feedback, while a small ACK control message gives per-frame application feedback.
+Alternatives considered:
+- Notify plus custom retry only: duplicates protocol-level reliability work in application space.
+- Indication with no frame ACK: confirms each fragment but still cannot distinguish "all fragments confirmed" from "peer fully reassembled the logical frame".
 
 5. Transport sizing will use negotiated runtime limits and valid configured ranges.
 Rationale: The current demo hard-codes aggressive payload and interval targets, but the observed traces and SDK headers show that configured values are not sufficient evidence of the actual link cadence. The bridge must size fragments from negotiated runtime limits and request only documented legal connection parameters.
@@ -62,6 +74,9 @@ Alternatives considered:
 - [Risk] Reassembly adds latency if fragments are lost or delayed.
   -> Mitigation: Track per-frame age and error counters, and bound reassembly wait behavior.
 
+- [Risk] Indication-based reliable transport will lower peak throughput compared with notify-only fire-and-forget transport.
+  -> Mitigation: Start with stop-and-wait semantics for correctness, keep the reliable transport logic isolated, and defer any pipelining optimization until after lossless behavior is confirmed.
+
 - [Risk] Choosing the wrong UART frame extractor could misclassify traffic.
   -> Mitigation: Isolate framing strategy behind a small module and validate it against the captured image-refresh traces before enabling it broadly.
 
@@ -74,8 +89,9 @@ Alternatives considered:
 2. Introduce logical frame ingress parsing and a bounded frame queue on the UART-to-SLE path.
 3. Add deterministic fragment metadata, negotiated-limit sizing, and receiver-side reassembly on the SLE path.
 4. Update UART egress to emit one DMA write per complete logical frame.
-5. Re-run the image-refresh capture and compare send-to-receive delay, intra-frame gap, and large-frame split patterns against the baseline.
-6. Roll back by disabling frame-aware mode in the demo sample if the new path causes unacceptable regressions.
+5. Introduce reliable `server -> client` transport semantics using indication confirm, frame ACK, timeout handling, and duplicate suppression.
+6. Re-run the image-refresh capture and compare send-to-receive delay, intra-frame gap, retry behavior, and large-frame split patterns against the baseline.
+7. Roll back by disabling reliable frame-aware mode in the demo sample if the new path causes unacceptable regressions.
 
 ## Open Questions
 

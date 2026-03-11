@@ -20,6 +20,9 @@ static void print_stats(void)
     uint32_t elapsed_s;
     uint32_t avg_tx_delay = 0;
     uint32_t avg_rx_delay = 0;
+    uint32_t avg_reassembly = 0;
+    uint32_t avg_uart_wait = 0;
+    uint32_t avg_uart_submit = 0;
     uint32_t avg_gap = 0;
 
     if (now - last_print < DEMO_STATS_INTERVAL_MS) {
@@ -38,6 +41,15 @@ static void print_stats(void)
     if (g_demo_stats.frame_rx_delay_count > 0U) {
         avg_rx_delay = g_demo_stats.frame_rx_delay_us_sum / g_demo_stats.frame_rx_delay_count;
     }
+    if (g_demo_stats.sle_reassembly_count > 0U) {
+        avg_reassembly = g_demo_stats.sle_reassembly_us_sum / g_demo_stats.sle_reassembly_count;
+    }
+    if (g_demo_stats.uart_queue_wait_count > 0U) {
+        avg_uart_wait = g_demo_stats.uart_queue_wait_us_sum / g_demo_stats.uart_queue_wait_count;
+    }
+    if (g_demo_stats.uart_submit_count > 0U) {
+        avg_uart_submit = g_demo_stats.uart_submit_us_sum / g_demo_stats.uart_submit_count;
+    }
     if (g_demo_stats.intra_frame_gap_count > 0U) {
         avg_gap = g_demo_stats.intra_frame_gap_us_sum / g_demo_stats.intra_frame_gap_count;
     }
@@ -50,6 +62,14 @@ static void print_stats(void)
         g_demo_stats.uart_rx_drop_frames, g_demo_stats.uart_tx_drop_frames,
         g_demo_stats.sle_tx_frames, g_demo_stats.sle_rx_frames,
         g_demo_stats.sle_tx_fragments, g_demo_stats.sle_rx_fragments);
+    DEMO_INFO("[FAST PATH] uart_tx hit=%u miss=%u",
+        g_demo_stats.uart_tx_fast_path_hits, g_demo_stats.uart_tx_fast_path_misses);
+    DEMO_INFO("[RELIABLE] ack_mode=%u ack_tx=%u ack_rx=%u retry=%u hard_fail=%u dup=%u ind_to=%u frame_ack_to=%u",
+        DEMO_SLE_FRAME_ACK_ENABLE,
+        g_demo_stats.sle_ack_sent, g_demo_stats.sle_ack_received,
+        g_demo_stats.sle_tx_retry_frames, g_demo_stats.sle_tx_hard_fail,
+        g_demo_stats.sle_rx_duplicate_frames, g_demo_stats.sle_indicate_timeout_cnt,
+        g_demo_stats.sle_frame_ack_timeout_cnt);
     DEMO_INFO("[TRANSPORT] req_int=0x%x-0x%x nego=0x%x mtu=%u eff=%u frag=%u data_len=%u ll=%u rate=%u",
         g_demo_stats.sle_requested_conn_interval_min,
         g_demo_stats.sle_requested_conn_interval_max,
@@ -67,10 +87,14 @@ static void print_stats(void)
         g_demo_stats.uart_rx_invalid_bytes,
         g_demo_stats.sle_reassembly_reset_cnt,
         g_demo_stats.sle_reassembly_drop_frames);
-    DEMO_INFO("[DELAY] tx_queue min=%uus avg=%uus max=%uus | rx_delivery min=%uus avg=%uus max=%uus | gap min=%uus avg=%uus max=%uus",
+    DEMO_INFO("[DELAY] tx_queue min=%uus avg=%uus max=%uus | sle_to_uart min=%uus avg=%uus max=%uus | gap min=%uus avg=%uus max=%uus",
         g_demo_stats.frame_tx_delay_us_min, avg_tx_delay, g_demo_stats.frame_tx_delay_us_max,
         g_demo_stats.frame_rx_delay_us_min, avg_rx_delay, g_demo_stats.frame_rx_delay_us_max,
         g_demo_stats.intra_frame_gap_us_min, avg_gap, g_demo_stats.intra_frame_gap_us_max);
+    DEMO_INFO("[RX PATH] reassembly min=%uus avg=%uus max=%uus | uart_wait min=%uus avg=%uus max=%uus | uart_submit min=%uus avg=%uus max=%uus",
+        g_demo_stats.sle_reassembly_us_min, avg_reassembly, g_demo_stats.sle_reassembly_us_max,
+        g_demo_stats.uart_queue_wait_us_min, avg_uart_wait, g_demo_stats.uart_queue_wait_us_max,
+        g_demo_stats.uart_submit_us_min, avg_uart_submit, g_demo_stats.uart_submit_us_max);
 }
 
 static void *demo_bridge_task(const char *arg)
@@ -79,7 +103,11 @@ static void *demo_bridge_task(const char *arg)
 
     DEMO_INFO("========================================");
     DEMO_INFO("SLE UART Bridge Starting...");
-    DEMO_INFO("Role: HYBRID");
+#if IS_SLE_SERVER
+    DEMO_INFO("Role: SERVER");
+#else
+    DEMO_INFO("Role: CLIENT");
+#endif
     DEMO_INFO("UART: %d @ %d baud", DEMO_UART_BUS, DEMO_UART_BAUDRATE);
     DEMO_INFO("Frame queue depth=%d max_frame=%d", DEMO_FRAME_QUEUE_DEPTH, DEMO_LOGICAL_FRAME_MAX_SIZE);
     DEMO_INFO("========================================");
@@ -117,6 +145,11 @@ static void *demo_bridge_task(const char *arg)
         work_done += demo_sle_tx_process();
         t1 = (uint32_t)uapi_systick_get_us();
         g_demo_stats.time_sle_tx_us += (t1 - t0);
+
+        t0 = (uint32_t)uapi_systick_get_us();
+        demo_sle_process_deferred();
+        t1 = (uint32_t)uapi_systick_get_us();
+        g_demo_stats.time_sle_to_uart_us += (t1 - t0);
 
         t0 = (uint32_t)uapi_systick_get_us();
         work_done += demo_uart_tx_process();
