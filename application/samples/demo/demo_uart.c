@@ -18,6 +18,9 @@ typedef struct {
     uint16_t used;
     uint16_t expected_len;
     uint32_t first_byte_timestamp_us;
+    uint32_t last_byte_timestamp_us;
+    uint32_t raw_input_bytes;
+    uint32_t dropped_bytes;
 } demo_uart_frame_parser_t;
 
 static demo_frame_queue_t s_uart_rx_frames;
@@ -29,6 +32,21 @@ static volatile uint8_t s_dma_tx_idx = 0;
 static volatile bool s_dma_tx_busy = false;
 static uint8_t s_uart_rx_buf[DEMO_UART_RX_BUFFER_SIZE];
 static uint16_t s_next_uart_frame_id = 1;
+static osal_mutex s_uart_tx_lock;
+
+static void demo_uart_log_crc_audit(const char *stage, uint16_t frame_id, const uint8_t *data,
+    uint16_t len, bool fast_path)
+{
+    uint32_t crc32;
+
+    if (stage == NULL || data == NULL || len == 0U) {
+        return;
+    }
+
+    crc32 = demo_logical_frame_crc32(data, len);
+    DEMO_CRC_LOG("%s id=%u len=%u crc32=0x%08x%s",
+        stage, frame_id, len, crc32, fast_path ? " fast=1" : "");
+}
 
 static uart_write_dma_config_t s_dma_cfg = {
     .src_width = HAL_DMA_TRANSFER_WIDTH_8,
@@ -51,24 +69,38 @@ static uint16_t demo_uart_next_frame_id(void)
     return frame_id;
 }
 
-static void demo_uart_parser_drop_prefix(demo_uart_frame_parser_t *parser, uint16_t count)
+static void demo_uart_parser_reset(demo_uart_frame_parser_t *parser)
+{
+    if (parser == NULL) {
+        return;
+    }
+
+    parser->used = 0;
+    parser->expected_len = 0;
+    parser->first_byte_timestamp_us = 0;
+    parser->last_byte_timestamp_us = 0;
+    parser->raw_input_bytes = 0;
+    parser->dropped_bytes = 0;
+}
+
+static void demo_uart_parser_drop_prefix(demo_uart_frame_parser_t *parser, uint16_t count, bool count_as_drop)
 {
     if (parser == NULL || count == 0) {
         return;
     }
 
+    if (count_as_drop) {
+        parser->dropped_bytes += count;
+    }
+
     if (count >= parser->used) {
-        parser->used = 0;
-        parser->expected_len = 0;
-        parser->first_byte_timestamp_us = 0;
+        demo_uart_parser_reset(parser);
         return;
     }
 
     if (memmove_s(parser->buffer, sizeof(parser->buffer), parser->buffer + count,
         parser->used - count) != EOK) {
-        parser->used = 0;
-        parser->expected_len = 0;
-        parser->first_byte_timestamp_us = 0;
+        demo_uart_parser_reset(parser);
         return;
     }
 
@@ -76,6 +108,27 @@ static void demo_uart_parser_drop_prefix(demo_uart_frame_parser_t *parser, uint1
     if (parser->used < DEMO_LOGICAL_FRAME_HEADER_SIZE) {
         parser->expected_len = 0;
     }
+}
+
+static void demo_uart_parser_drop_stale_frame(demo_uart_frame_parser_t *parser, uint32_t timestamp_us)
+{
+    uint32_t gap_us;
+
+    if (parser == NULL || parser->used == 0 || parser->last_byte_timestamp_us == 0U ||
+        timestamp_us < parser->last_byte_timestamp_us) {
+        return;
+    }
+
+    gap_us = timestamp_us - parser->last_byte_timestamp_us;
+    if (gap_us <= DEMO_UART_FRAME_GAP_TIMEOUT_US) {
+        return;
+    }
+
+    STATS_INC(uart_rx_drop_frames);
+    STATS_ADD(uart_rx_drop_bytes, parser->used);
+    DEMO_ERR("UART RX partial frame timeout: used=%u expected=%u raw_in=%u dropped=%u gap=%u us",
+        parser->used, parser->expected_len, parser->raw_input_bytes, parser->dropped_bytes, gap_us);
+    demo_uart_parser_reset(parser);
 }
 
 static void demo_uart_queue_ingress_frame(demo_uart_frame_parser_t *parser, uint32_t ready_timestamp_us)
@@ -99,10 +152,11 @@ static void demo_uart_queue_ingress_frame(demo_uart_frame_parser_t *parser, uint
         STATS_SET_HWM(uart_rx_ring_hwm, demo_frame_queue_count(&s_uart_rx_frames));
         DEMO_LOG("UART RX frame queued: id=%u len=%u q=%u",
             frame_id, parser->expected_len, demo_frame_queue_count(&s_uart_rx_frames));
+        demo_uart_log_crc_audit("UART_RX", frame_id, parser->buffer, parser->expected_len, false);
         osal_event_write(&g_bridge_event, DEMO_EVENT_UART_RX);
     }
 
-    demo_uart_parser_drop_prefix(parser, parser->expected_len);
+    demo_uart_parser_drop_prefix(parser, parser->expected_len, false);
     parser->expected_len = 0;
 }
 
@@ -117,7 +171,7 @@ static void demo_uart_parser_process(demo_uart_frame_parser_t *parser, uint32_t 
     while (parser->used > 0) {
         if (parser->used >= 2 && !demo_logical_frame_header_valid(parser->buffer)) {
             STATS_INC(uart_rx_invalid_bytes);
-            demo_uart_parser_drop_prefix(parser, 1);
+            demo_uart_parser_drop_prefix(parser, 1, true);
             continue;
         }
 
@@ -131,7 +185,7 @@ static void demo_uart_parser_process(demo_uart_frame_parser_t *parser, uint32_t 
             STATS_INC(uart_rx_oversize_frames);
             STATS_INC(uart_rx_invalid_bytes);
             DEMO_ERR("UART RX frame length invalid: total=%u", expected_len);
-            demo_uart_parser_drop_prefix(parser, 1);
+            demo_uart_parser_drop_prefix(parser, 1, true);
             continue;
         }
 
@@ -152,9 +206,13 @@ static void demo_uart_parser_feed(const uint8_t *buffer, uint16_t length, uint32
     uint16_t copy_len;
     uint16_t space_left;
 
+    demo_uart_parser_drop_stale_frame(&s_uart_rx_parser, timestamp_us);
+
     while (length > 0) {
         if (s_uart_rx_parser.used == 0) {
             s_uart_rx_parser.first_byte_timestamp_us = timestamp_us;
+            s_uart_rx_parser.raw_input_bytes = 0;
+            s_uart_rx_parser.dropped_bytes = 0;
         }
 
         space_left = (uint16_t)(DEMO_LOGICAL_FRAME_MAX_SIZE - s_uart_rx_parser.used);
@@ -162,9 +220,7 @@ static void demo_uart_parser_feed(const uint8_t *buffer, uint16_t length, uint32
             STATS_INC(uart_rx_oversize_frames);
             STATS_ADD(uart_rx_drop_bytes, length);
             DEMO_ERR("UART RX parser overflow, resetting state");
-            s_uart_rx_parser.used = 0;
-            s_uart_rx_parser.expected_len = 0;
-            s_uart_rx_parser.first_byte_timestamp_us = 0;
+            demo_uart_parser_reset(&s_uart_rx_parser);
             return;
         }
 
@@ -175,12 +231,17 @@ static void demo_uart_parser_feed(const uint8_t *buffer, uint16_t length, uint32
         }
 
         s_uart_rx_parser.used = (uint16_t)(s_uart_rx_parser.used + copy_len);
+        s_uart_rx_parser.last_byte_timestamp_us = timestamp_us;
+        s_uart_rx_parser.raw_input_bytes += copy_len;
         buffer += copy_len;
         length = (uint16_t)(length - copy_len);
 
         demo_uart_parser_process(&s_uart_rx_parser, timestamp_us);
         if (s_uart_rx_parser.used > 0 && s_uart_rx_parser.first_byte_timestamp_us == 0) {
             s_uart_rx_parser.first_byte_timestamp_us = timestamp_us;
+        }
+        if (s_uart_rx_parser.used > 0 && s_uart_rx_parser.last_byte_timestamp_us == 0) {
+            s_uart_rx_parser.last_byte_timestamp_us = timestamp_us;
         }
     }
 }
@@ -235,6 +296,10 @@ int demo_uart_init(void)
     demo_frame_queue_init(&s_uart_rx_frames);
     demo_frame_queue_init(&s_uart_tx_frames);
     (void)memset_s(&s_uart_rx_parser, sizeof(s_uart_rx_parser), 0, sizeof(s_uart_rx_parser));
+    if (osal_mutex_init(&s_uart_tx_lock) != OSAL_SUCCESS) {
+        DEMO_ERR("UART TX lock init failed");
+        return -1;
+    }
 
     uart_init_pin();
 
@@ -253,6 +318,7 @@ int demo_uart_init(void)
     ret = uapi_uart_init(DEMO_UART_BUS, &pin_cfg, &attr, &ext_cfg, &s_uart_buf_cfg);
     if (ret != ERRCODE_SUCC) {
         DEMO_ERR("UART init failed: 0x%x", ret);
+        osal_mutex_destroy(&s_uart_tx_lock);
         return -1;
     }
 
@@ -261,6 +327,8 @@ int demo_uart_init(void)
         DEMO_UART_RX_THRESHOLD, uart_rx_callback);
     if (ret != ERRCODE_SUCC) {
         DEMO_ERR("UART RX callback register failed: 0x%x", ret);
+        (void)uapi_uart_deinit(DEMO_UART_BUS);
+        osal_mutex_destroy(&s_uart_tx_lock);
         return -1;
     }
 
@@ -272,6 +340,7 @@ void demo_uart_deinit(void)
 {
     uapi_uart_unregister_rx_callback(DEMO_UART_BUS);
     uapi_uart_deinit(DEMO_UART_BUS);
+    osal_mutex_destroy(&s_uart_tx_lock);
 }
 
 void demo_uart_reset_queues(void)
@@ -399,9 +468,18 @@ bool demo_uart_tx_direct_frame(const uint8_t *data, uint16_t len, uint16_t frame
     if (!demo_uart_tx_can_fast_path()) {
         return false;
     }
+    if (!osal_mutex_trylock(&s_uart_tx_lock)) {
+        return false;
+    }
+    if (!demo_uart_tx_can_fast_path()) {
+        osal_mutex_unlock(&s_uart_tx_lock);
+        return false;
+    }
 
     tx_start_us = (uint32_t)uapi_systick_get_us();
+    demo_uart_log_crc_audit("UART_TX", frame_id, data, len, true);
     sent = demo_uart_tx_send(data, len);
+    osal_mutex_unlock(&s_uart_tx_lock);
     if (sent != len) {
         return false;
     }
@@ -420,6 +498,10 @@ uint32_t demo_uart_tx_process(void)
     uint32_t total_sent = 0;
     uint32_t batch = 0;
 
+    if (!osal_mutex_trylock(&s_uart_tx_lock)) {
+        return 0;
+    }
+
     while (batch < DEMO_MAX_DMA_PER_LOOP) {
         uint32_t tx_start_us;
         uint32_t now_us;
@@ -431,6 +513,7 @@ uint32_t demo_uart_tx_process(void)
         }
 
         tx_start_us = (uint32_t)uapi_systick_get_us();
+        demo_uart_log_crc_audit("UART_TX", slot->frame_id, slot->data, slot->len, false);
         sent = demo_uart_tx_send(slot->data, slot->len);
         if (sent != slot->len) {
             STATS_INC(uart_tx_drop_frames);
@@ -446,5 +529,6 @@ uint32_t demo_uart_tx_process(void)
         batch++;
     }
 
+    osal_mutex_unlock(&s_uart_tx_lock);
     return total_sent;
 }

@@ -77,6 +77,18 @@ static volatile uint8_t s_client_tx_idx = 0;
 static sle_addr_t s_remote_addr = {0};
 static sle_addr_t s_local_addr = {0};
 
+static void demo_sle_log_crc_audit(const char *stage, uint16_t frame_id, const uint8_t *data, uint16_t len)
+{
+    uint32_t crc32;
+
+    if (stage == NULL || data == NULL || len == 0U) {
+        return;
+    }
+
+    crc32 = demo_logical_frame_crc32(data, len);
+    DEMO_CRC_LOG("%s id=%u len=%u crc32=0x%08x", stage, frame_id, len, crc32);
+}
+
 static errcode_t client_start_scan(void);
 static void on_sle_enable(errcode_t status);
 static void on_seek_enable(errcode_t status);
@@ -343,18 +355,21 @@ static void demo_sle_schedule_control(uint8_t packet_type, uint16_t frame_id, co
 }
 
 static void demo_sle_record_sle_delivery(const uint8_t *data, uint16_t len, uint16_t frame_id,
-    uint32_t first_rx_us, uint32_t reassembly_us, uint32_t max_gap_us)
+    uint8_t frag_count, uint32_t first_rx_us, uint32_t reassembly_us, uint32_t max_gap_us)
 {
     uint32_t ready_timestamp_us = (uint32_t)uapi_systick_get_us();
+#if DEMO_DEBUG_LOG
     uint32_t rx_to_queue_us = 0;
 
     if (first_rx_us > 0U && ready_timestamp_us >= first_rx_us) {
         rx_to_queue_us = ready_timestamp_us - first_rx_us;
     }
+#endif
     STATS_ADD(sle_rx_bytes, len);
     STATS_INC(sle_rx_frames);
     DEMO_LOG("Peer SLE frame complete: id=%u len=%u reassembly=%u us max_gap=%u us",
         frame_id, len, reassembly_us, max_gap_us);
+    demo_sle_log_crc_audit("SLE_RX", frame_id, data, len);
     if (demo_uart_tx_direct_frame(data, len, frame_id, first_rx_us, ready_timestamp_us, reassembly_us)) {
         STATS_INC(uart_tx_fast_path_hits);
         DEMO_LOG("Peer UART fast-path: id=%u len=%u rx_to_queue=%u us", frame_id, len, rx_to_queue_us);
@@ -466,7 +481,7 @@ static void demo_sle_handle_rx_payload(const uint8_t *data, uint16_t len)
         if (len <= DEMO_LOGICAL_FRAME_MAX_SIZE &&
             demo_logical_frame_header_valid(data) &&
             demo_logical_frame_total_len(data) == len) {
-            demo_sle_record_sle_delivery(data, len, 0, rx_time_us, 0, 0);
+            demo_sle_record_sle_delivery(data, len, 0, 1U, rx_time_us, 0, 0);
             return;
         }
         STATS_ADD(sle_rx_drop_bytes, len);
@@ -572,7 +587,7 @@ static void demo_sle_handle_rx_payload(const uint8_t *data, uint16_t len)
         s_rx_state.last_completed_frame_id = s_rx_state.frame_id;
         s_rx_state.last_completed_valid = true;
         demo_sle_record_sle_delivery(s_rx_state.buffer, s_rx_state.total_len, s_rx_state.frame_id,
-            s_rx_state.first_fragment_us, reassembly_us, s_rx_state.max_gap_us);
+            s_rx_state.frag_count, s_rx_state.first_fragment_us, reassembly_us, s_rx_state.max_gap_us);
         demo_sle_reset_rx_state(NULL);
     }
 }
@@ -1266,6 +1281,7 @@ static uint32_t demo_sle_send_next_fragment(void)
         DEMO_LOG("SLE TX frame start: id=%u len=%u frags=%u queue_delay=%u us eff=%u frag=%u",
             s_tx_state.frame_id, frame->len, s_tx_state.frag_count,
             frame_delay_us, s_effective_payload, s_fragment_payload);
+        demo_sle_log_crc_audit("SLE_TX", s_tx_state.frame_id, frame->data, frame->len);
     }
 
     STATS_INC(sle_tx_fragments);
