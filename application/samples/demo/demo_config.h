@@ -38,7 +38,7 @@ extern "C" {
 /*============================================================================
  * Logical Frame / Queue Configuration
  *============================================================================*/
-#define DEMO_UART_RX_BUFFER_SIZE 4096
+#define DEMO_UART_RX_BUFFER_SIZE DEMO_LOGICAL_FRAME_MAX_SIZE
 #define DEMO_UART_RX_THRESHOLD 16
 #define DEMO_UART_TX_BUFFER_SIZE 4096
 #define DEMO_UART_FRAME_GAP_TIMEOUT_US 20000U
@@ -92,7 +92,6 @@ extern "C" {
  * Debug Configuration
  *============================================================================*/
 #define DEMO_DEBUG_LOG 0
-#define DEMO_CRC_AUDIT_LOG 1
 #define DEMO_STATS_INTERVAL_MS 10000
 
 #if DEMO_DEBUG_LOG
@@ -103,11 +102,6 @@ extern "C" {
 
 #define DEMO_INFO(fmt, ...) osal_printk("[DEMO] " fmt "\r\n", ##__VA_ARGS__)
 #define DEMO_ERR(fmt, ...) osal_printk("[DEMO ERR] " fmt "\r\n", ##__VA_ARGS__)
-#if DEMO_CRC_AUDIT_LOG
-#define DEMO_CRC_LOG(fmt, ...) osal_printk("[DEMO CRC] " fmt "\r\n", ##__VA_ARGS__)
-#else
-#define DEMO_CRC_LOG(fmt, ...)
-#endif
 
 /*============================================================================
  * Statistics Structure

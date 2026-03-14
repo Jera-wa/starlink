@@ -33,25 +33,22 @@ static volatile bool s_dma_tx_busy = false;
 static uint8_t s_uart_rx_buf[DEMO_UART_RX_BUFFER_SIZE];
 static uint16_t s_next_uart_frame_id = 1;
 static osal_mutex s_uart_tx_lock;
-
-static void demo_uart_log_crc_audit(const char *stage, uint16_t frame_id, const uint8_t *data,
-    uint16_t len, bool fast_path)
-{
-    uint32_t crc32;
-
-    if (stage == NULL || data == NULL || len == 0U) {
-        return;
-    }
-
-    crc32 = demo_logical_frame_crc32(data, len);
-    DEMO_CRC_LOG("%s id=%u len=%u crc32=0x%08x%s",
-        stage, frame_id, len, crc32, fast_path ? " fast=1" : "");
-}
+#if IS_SLE_CLIENT
+static osal_task *s_uart_rx_task = NULL;
+static volatile bool s_uart_rx_task_running = false;
+#endif
 
 static uart_write_dma_config_t s_dma_cfg = {
     .src_width = HAL_DMA_TRANSFER_WIDTH_8,
     .dest_width = HAL_DMA_TRANSFER_WIDTH_8,
     .burst_length = HAL_DMA_BURST_TRANSACTION_LENGTH_4,
+    .priority = HAL_DMA_CH_PRIORITY_0
+};
+
+static uart_write_dma_config_t s_rx_dma_cfg = {
+    .src_width = HAL_DMA_TRANSFER_WIDTH_8,
+    .dest_width = HAL_DMA_TRANSFER_WIDTH_8,
+    .burst_length = HAL_DMA_BURST_TRANSACTION_LENGTH_1,
     .priority = HAL_DMA_CH_PRIORITY_0
 };
 
@@ -67,6 +64,38 @@ static uint16_t demo_uart_next_frame_id(void)
         frame_id = s_next_uart_frame_id++;
     }
     return frame_id;
+}
+
+static void demo_uart_queue_rx_frame(const uint8_t *data, uint16_t len,
+    uint32_t enqueue_timestamp_us, uint32_t ready_timestamp_us)
+{
+    uint16_t frame_id;
+    uint8_t queued;
+    uint8_t queue_count;
+    uint32_t irq_sts;
+
+    if (data == NULL || len == 0U || len > DEMO_LOGICAL_FRAME_MAX_SIZE) {
+        return;
+    }
+
+    frame_id = demo_uart_next_frame_id();
+    irq_sts = osal_irq_lock();
+    queued = demo_frame_queue_push(&s_uart_rx_frames, data, len, frame_id,
+        enqueue_timestamp_us, ready_timestamp_us, 0U);
+    queue_count = demo_frame_queue_count(&s_uart_rx_frames);
+    osal_irq_restore(irq_sts);
+
+    if (!queued) {
+        STATS_INC(uart_rx_drop_frames);
+        STATS_ADD(uart_rx_drop_bytes, len);
+        DEMO_ERR("UART RX frame queue full: id=%u len=%u", frame_id, len);
+        return;
+    }
+
+    STATS_INC(uart_rx_frames);
+    STATS_SET_HWM(uart_rx_ring_hwm, queue_count);
+    DEMO_LOG("UART RX frame queued: id=%u len=%u q=%u", frame_id, len, queue_count);
+    osal_event_write(&g_bridge_event, DEMO_EVENT_UART_RX);
 }
 
 static void demo_uart_parser_reset(demo_uart_frame_parser_t *parser)
@@ -133,28 +162,12 @@ static void demo_uart_parser_drop_stale_frame(demo_uart_frame_parser_t *parser, 
 
 static void demo_uart_queue_ingress_frame(demo_uart_frame_parser_t *parser, uint32_t ready_timestamp_us)
 {
-    uint16_t frame_id;
-    uint8_t queued;
-
     if (parser == NULL || parser->expected_len == 0 || parser->used < parser->expected_len) {
         return;
     }
 
-    frame_id = demo_uart_next_frame_id();
-    queued = demo_frame_queue_push(&s_uart_rx_frames, parser->buffer, parser->expected_len,
-        frame_id, parser->first_byte_timestamp_us, ready_timestamp_us, 0U);
-    if (!queued) {
-        STATS_INC(uart_rx_drop_frames);
-        STATS_ADD(uart_rx_drop_bytes, parser->expected_len);
-        DEMO_ERR("UART RX frame queue full: id=%u len=%u", frame_id, parser->expected_len);
-    } else {
-        STATS_INC(uart_rx_frames);
-        STATS_SET_HWM(uart_rx_ring_hwm, demo_frame_queue_count(&s_uart_rx_frames));
-        DEMO_LOG("UART RX frame queued: id=%u len=%u q=%u",
-            frame_id, parser->expected_len, demo_frame_queue_count(&s_uart_rx_frames));
-        demo_uart_log_crc_audit("UART_RX", frame_id, parser->buffer, parser->expected_len, false);
-        osal_event_write(&g_bridge_event, DEMO_EVENT_UART_RX);
-    }
+    demo_uart_queue_rx_frame(parser->buffer, parser->expected_len,
+        parser->first_byte_timestamp_us, ready_timestamp_us);
 
     demo_uart_parser_drop_prefix(parser, parser->expected_len, false);
     parser->expected_len = 0;
@@ -257,9 +270,133 @@ static void uart_rx_callback(const void *buffer, uint16_t length, bool error)
     rx_time_us = (uint32_t)uapi_systick_get_us();
     g_demo_stats.uart_rx_timestamp_us = rx_time_us;
     STATS_ADD(uart_rx_bytes, length);
-
     demo_uart_parser_feed((const uint8_t *)buffer, length, rx_time_us);
 }
+
+#if IS_SLE_CLIENT
+static bool demo_uart_dma_read_exact(uint8_t *buffer, uint16_t length)
+{
+    int32_t ret;
+
+    if (buffer == NULL || length == 0U) {
+        return false;
+    }
+
+    ret = uapi_uart_read_by_dma(DEMO_UART_BUS, buffer, length, &s_rx_dma_cfg);
+    if (ret >= 0) {
+        return true;
+    }
+
+    if (s_uart_rx_task_running) {
+        DEMO_ERR("UART RX DMA read failed: want=%u got=%d", length, ret);
+    }
+    return false;
+}
+
+static bool demo_uart_dma_sync_header(uint8_t *header, uint16_t *total_len, uint32_t *first_byte_timestamp_us)
+{
+    uint16_t frame_len;
+
+    if (header == NULL || total_len == NULL || first_byte_timestamp_us == NULL) {
+        return false;
+    }
+
+    if (!demo_uart_dma_read_exact(header, DEMO_LOGICAL_FRAME_HEADER_SIZE)) {
+        return false;
+    }
+
+    while (s_uart_rx_task_running) {
+        if (demo_logical_frame_header_valid(header)) {
+            frame_len = demo_logical_frame_total_len(header);
+            if (frame_len >= DEMO_LOGICAL_FRAME_HEADER_SIZE &&
+                frame_len <= DEMO_LOGICAL_FRAME_MAX_SIZE) {
+                *total_len = frame_len;
+                *first_byte_timestamp_us = (uint32_t)uapi_systick_get_us();
+                return true;
+            }
+            STATS_INC(uart_rx_oversize_frames);
+            DEMO_ERR("UART RX frame length invalid: total=%u", frame_len);
+        }
+
+        STATS_INC(uart_rx_invalid_bytes);
+        header[0] = header[1];
+        header[1] = header[2];
+        header[2] = header[3];
+        if (!demo_uart_dma_read_exact(&header[3], 1)) {
+            return false;
+        }
+    }
+
+    return false;
+}
+
+static void *demo_uart_rx_dma_task(const char *arg)
+{
+    uint8_t frame_buf[DEMO_LOGICAL_FRAME_MAX_SIZE];
+    uint8_t header[DEMO_LOGICAL_FRAME_HEADER_SIZE];
+    uint16_t frame_len;
+    uint16_t payload_len;
+    uint32_t first_byte_timestamp_us;
+    uint32_t ready_timestamp_us;
+
+    (void)arg;
+    while (s_uart_rx_task_running) {
+        if (!demo_uart_dma_sync_header(header, &frame_len, &first_byte_timestamp_us)) {
+            break;
+        }
+
+        if (memcpy_s(frame_buf, sizeof(frame_buf), header, sizeof(header)) != EOK) {
+            continue;
+        }
+
+        payload_len = (uint16_t)(frame_len - DEMO_LOGICAL_FRAME_HEADER_SIZE);
+        if (payload_len > 0U &&
+            !demo_uart_dma_read_exact(frame_buf + DEMO_LOGICAL_FRAME_HEADER_SIZE, payload_len)) {
+            break;
+        }
+
+        ready_timestamp_us = (uint32_t)uapi_systick_get_us();
+        g_demo_stats.uart_rx_timestamp_us = ready_timestamp_us;
+        STATS_ADD(uart_rx_bytes, frame_len);
+        demo_uart_queue_rx_frame(frame_buf, frame_len, first_byte_timestamp_us, ready_timestamp_us);
+    }
+
+    s_uart_rx_task_running = false;
+    return NULL;
+}
+
+static int demo_uart_start_rx_dma_task(void)
+{
+    osal_task *task_handle = NULL;
+
+    osal_kthread_lock();
+    s_uart_rx_task_running = true;
+    task_handle = osal_kthread_create((osal_kthread_handler)demo_uart_rx_dma_task, 0,
+        "DemoUartRxTask", DEMO_TASK_STACK_SIZE);
+    if (task_handle != NULL) {
+        (void)osal_kthread_set_priority(task_handle, DEMO_TASK_PRIORITY);
+        s_uart_rx_task = task_handle;
+    } else {
+        s_uart_rx_task_running = false;
+    }
+    osal_kthread_unlock();
+
+    if (task_handle == NULL) {
+        DEMO_ERR("UART RX DMA task create failed");
+        return -1;
+    }
+    return 0;
+}
+
+static void demo_uart_stop_rx_dma_task(void)
+{
+    s_uart_rx_task_running = false;
+    if (s_uart_rx_task != NULL) {
+        osal_kthread_destroy(s_uart_rx_task, 0);
+        s_uart_rx_task = NULL;
+    }
+}
+#endif
 
 static void uart_init_pin(void)
 {
@@ -287,10 +424,11 @@ int demo_uart_init(void)
         .rts_pin = PIN_NONE
     };
     uart_extra_attr_t ext_cfg = {
-        .tx_dma_enable = true,
+        .tx_dma_enable = IS_SLE_CLIENT ? false : true,
         .tx_int_threshold = UART_FIFO_INT_TX_LEVEL_EQ_0_CHARACTER,
-        .rx_dma_enable = false,
-        .rx_int_threshold = UART_FIFO_INT_RX_LEVEL_1_CHARACTER
+        .rx_dma_enable = IS_SLE_CLIENT ? true : false,
+        .rx_int_threshold = IS_SLE_CLIENT ? UART_FIFO_INT_RX_LEVEL_2_LESS_THAN_FULL :
+            UART_FIFO_INT_RX_LEVEL_1_CHARACTER
     };
 
     demo_frame_queue_init(&s_uart_rx_frames);
@@ -322,6 +460,14 @@ int demo_uart_init(void)
         return -1;
     }
 
+#if IS_SLE_CLIENT
+    if (demo_uart_start_rx_dma_task() != 0) {
+        (void)uapi_uart_deinit(DEMO_UART_BUS);
+        osal_mutex_destroy(&s_uart_tx_lock);
+        return -1;
+    }
+    DEMO_INFO("UART init OK (UART TX, frame-aware RX, RX DMA header/body)");
+#else
     ret = uapi_uart_register_rx_callback(DEMO_UART_BUS,
         UART_RX_CONDITION_FULL_OR_SUFFICIENT_DATA_OR_IDLE,
         DEMO_UART_RX_THRESHOLD, uart_rx_callback);
@@ -331,13 +477,16 @@ int demo_uart_init(void)
         osal_mutex_destroy(&s_uart_tx_lock);
         return -1;
     }
-
     DEMO_INFO("UART init OK (DMA TX, frame-aware RX)");
+#endif
     return 0;
 }
 
 void demo_uart_deinit(void)
 {
+#if IS_SLE_CLIENT
+    demo_uart_stop_rx_dma_task();
+#endif
     uapi_uart_unregister_rx_callback(DEMO_UART_BUS);
     uapi_uart_deinit(DEMO_UART_BUS);
     osal_mutex_destroy(&s_uart_tx_lock);
@@ -353,12 +502,18 @@ void demo_uart_reset_queues(void)
 
 const demo_frame_slot_t *demo_uart_rx_frame_peek(void)
 {
-    return demo_frame_queue_peek(&s_uart_rx_frames);
+    const demo_frame_slot_t *slot;
+    uint32_t irq_sts = osal_irq_lock();
+    slot = demo_frame_queue_peek(&s_uart_rx_frames);
+    osal_irq_restore(irq_sts);
+    return slot;
 }
 
 void demo_uart_rx_frame_consume(void)
 {
+    uint32_t irq_sts = osal_irq_lock();
     demo_frame_queue_consume(&s_uart_rx_frames);
+    osal_irq_restore(irq_sts);
 }
 
 bool demo_uart_queue_tx_frame(const uint8_t *data, uint16_t len, uint16_t frame_id,
@@ -424,13 +579,25 @@ static void demo_uart_record_tx_complete(uint16_t frame_id, uint16_t len,
 
 uint32_t demo_uart_tx_send(const uint8_t *data, uint32_t len)
 {
-    uint8_t *dma_buf;
     int32_t ret;
+
+#if !IS_SLE_CLIENT
+    uint8_t *dma_buf;
+#endif
 
     if (data == NULL || len == 0 || len > DEMO_DMA_CHUNK_SIZE) {
         return 0;
     }
 
+#if IS_SLE_CLIENT
+    ret = uapi_uart_write(DEMO_UART_BUS, data, len, 0);
+    if (ret < 0) {
+        DEMO_ERR("UART write failed: %d", ret);
+        return 0;
+    }
+    STATS_ADD(uart_tx_bytes, len);
+    return (uint32_t)ret;
+#else
     dma_buf = s_dma_tx_buf[s_dma_tx_idx];
     if (memcpy_s(dma_buf, DEMO_DMA_CHUNK_SIZE, data, len) != EOK) {
         return 0;
@@ -451,6 +618,7 @@ uint32_t demo_uart_tx_send(const uint8_t *data, uint32_t len)
     STATS_ADD(uart_tx_bytes, len);
     s_dma_tx_idx = (uint8_t)((s_dma_tx_idx + 1U) % DEMO_TX_BUFFER_COUNT);
     return len;
+#endif
 }
 
 int32_t demo_uart_tx_direct(const uint8_t *data, uint16_t len)
@@ -477,7 +645,6 @@ bool demo_uart_tx_direct_frame(const uint8_t *data, uint16_t len, uint16_t frame
     }
 
     tx_start_us = (uint32_t)uapi_systick_get_us();
-    demo_uart_log_crc_audit("UART_TX", frame_id, data, len, true);
     sent = demo_uart_tx_send(data, len);
     osal_mutex_unlock(&s_uart_tx_lock);
     if (sent != len) {
@@ -513,7 +680,6 @@ uint32_t demo_uart_tx_process(void)
         }
 
         tx_start_us = (uint32_t)uapi_systick_get_us();
-        demo_uart_log_crc_audit("UART_TX", slot->frame_id, slot->data, slot->len, false);
         sent = demo_uart_tx_send(slot->data, slot->len);
         if (sent != slot->len) {
             STATS_INC(uart_tx_drop_frames);
