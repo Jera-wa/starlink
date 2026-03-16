@@ -378,7 +378,7 @@ int demo_uart_init(void)
         .tx_dma_enable = IS_SLE_CLIENT ? false : true,
         .tx_int_threshold = UART_FIFO_INT_TX_LEVEL_EQ_0_CHARACTER,
         .rx_dma_enable = IS_SLE_CLIENT ? true : false,
-        .rx_int_threshold = IS_SLE_CLIENT ? UART_FIFO_INT_RX_LEVEL_2_LESS_THAN_FULL :
+        .rx_int_threshold = IS_SLE_CLIENT ? UART_FIFO_INT_RX_LEVEL_1_4 :
             UART_FIFO_INT_RX_LEVEL_1_CHARACTER
     };
 
