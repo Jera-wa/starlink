@@ -95,6 +95,21 @@ static void print_stats(void)
         g_demo_stats.sle_reassembly_us_min, avg_reassembly, g_demo_stats.sle_reassembly_us_max,
         g_demo_stats.uart_queue_wait_us_min, avg_uart_wait, g_demo_stats.uart_queue_wait_us_max,
         g_demo_stats.uart_submit_us_min, avg_uart_submit, g_demo_stats.uart_submit_us_max);
+#if IS_SLE_CLIENT
+    {
+        demo_uart_rx_diag_t uart_diag = {0};
+
+        demo_uart_get_rx_diag(&uart_diag);
+        DEMO_INFO("[UART DMA IDLE] idle_isr=%u raw_cb=%u bytes=%u last=%u | pub=%u bytes=%u idle_cb=%u soft=%u idle_fb=%u forced=%u | last(reason=%u xfer=%u rem=%u blk=%u rx=%u tail=%u combined=%u fifo_empty=%u)",
+            uart_diag.idle_isr_count, uart_diag.raw_callback_count, uart_diag.raw_callback_bytes,
+            uart_diag.raw_callback_last_len, uart_diag.publish_count, uart_diag.publish_bytes,
+            uart_diag.publish_from_idle_cb, uart_diag.publish_from_soft_flush,
+            uart_diag.publish_from_idle_fallback, uart_diag.forced_idle_request_count,
+            uart_diag.last_publish_reason, uart_diag.last_transfer_num, uart_diag.last_remaining,
+            uart_diag.last_received_blocks, uart_diag.last_received_len, uart_diag.last_idle_tail_len,
+            uart_diag.last_combined_len, uart_diag.last_rx_fifo_empty);
+    }
+#endif
 }
 
 static void *demo_bridge_task(const char *arg)
@@ -117,11 +132,13 @@ static void *demo_bridge_task(const char *arg)
         return NULL;
     }
 
+    DEMO_INFO("Bridge step: UART init begin");
     if (demo_uart_init() != 0) {
         DEMO_ERR("UART init failed!");
         return NULL;
     }
 
+    DEMO_INFO("Bridge step: SLE init begin");
     if (demo_sle_init() != 0) {
         DEMO_ERR("SLE init failed!");
         return NULL;
@@ -139,6 +156,7 @@ static void *demo_bridge_task(const char *arg)
         (void)osal_event_read(&g_bridge_event, DEMO_EVENT_ALL,
             DEMO_EVENT_TIMEOUT_MS, OSAL_WAITMODE_OR | OSAL_WAITMODE_CLR);
 
+        demo_uart_rx_poll();
         loop_start = (uint32_t)uapi_systick_get_ms();
 
         t0 = (uint32_t)uapi_systick_get_us();
@@ -146,10 +164,14 @@ static void *demo_bridge_task(const char *arg)
         t1 = (uint32_t)uapi_systick_get_us();
         g_demo_stats.time_sle_tx_us += (t1 - t0);
 
+        demo_uart_rx_poll();
+
         t0 = (uint32_t)uapi_systick_get_us();
         demo_sle_process_deferred();
         t1 = (uint32_t)uapi_systick_get_us();
         g_demo_stats.time_sle_to_uart_us += (t1 - t0);
+
+        demo_uart_rx_poll();
 
         t0 = (uint32_t)uapi_systick_get_us();
         work_done += demo_uart_tx_process();

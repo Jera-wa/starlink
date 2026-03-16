@@ -41,7 +41,7 @@ extern "C" {
 #define DEMO_UART_RX_BUFFER_SIZE DEMO_LOGICAL_FRAME_MAX_SIZE
 #define DEMO_UART_RX_THRESHOLD 16
 #define DEMO_UART_TX_BUFFER_SIZE 4096
-#define DEMO_UART_FRAME_GAP_TIMEOUT_US 20000U
+#define DEMO_UART_FRAME_GAP_TIMEOUT_US 50000U
 
 #define DEMO_LOGICAL_FRAME_MAX_SIZE 2304
 #define DEMO_FRAME_QUEUE_DEPTH 6
@@ -87,6 +87,7 @@ extern "C" {
 #define DEMO_TASK_PRIORITY 20
 #define DEMO_TASK_STACK_SIZE 0x1200
 #define DEMO_BRIDGE_POLL_MS 1
+#define DEMO_UART_RX_SOFT_FLUSH_POLL_MS 1
 
 /*============================================================================
  * Debug Configuration

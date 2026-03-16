@@ -54,6 +54,7 @@ static volatile uint16_t s_mtu_size = DEMO_SLE_MTU_SIZE;
 static volatile bool s_connected = false;
 static volatile bool s_paired = false;
 static volatile bool s_client_ready = false;
+static volatile uint16_t s_client_write_handle = 0;
 static bool s_seek_connect_pending = false;
 static bool s_local_addr_valid = false;
 static uint16_t s_requested_conn_interval_min = DEMO_SLE_CONN_INTV_MIN;
@@ -76,18 +77,6 @@ static uint8_t s_client_tx_buf[4][DEMO_SLE_MTU_SIZE];
 static volatile uint8_t s_client_tx_idx = 0;
 static sle_addr_t s_remote_addr = {0};
 static sle_addr_t s_local_addr = {0};
-
-static void demo_sle_log_crc_audit(const char *stage, uint16_t frame_id, const uint8_t *data, uint16_t len)
-{
-    uint32_t crc32;
-
-    if (stage == NULL || data == NULL || len == 0U) {
-        return;
-    }
-
-    crc32 = demo_logical_frame_crc32(data, len);
-    DEMO_CRC_LOG("%s id=%u len=%u crc32=0x%08x", stage, frame_id, len, crc32);
-}
 
 static errcode_t client_start_scan(void);
 static void on_sle_enable(errcode_t status);
@@ -293,7 +282,7 @@ static bool demo_sle_server_can_send(void)
 #if IS_SLE_SERVER
     return s_property_handle != 0U;
 #else
-    return s_client_write_param.handle != 0U;
+    return s_client_write_handle != 0U;
 #endif
 }
 
@@ -369,7 +358,6 @@ static void demo_sle_record_sle_delivery(const uint8_t *data, uint16_t len, uint
     STATS_INC(sle_rx_frames);
     DEMO_LOG("Peer SLE frame complete: id=%u len=%u reassembly=%u us max_gap=%u us",
         frame_id, len, reassembly_us, max_gap_us);
-    demo_sle_log_crc_audit("SLE_RX", frame_id, data, len);
     if (demo_uart_tx_direct_frame(data, len, frame_id, first_rx_us, ready_timestamp_us, reassembly_us)) {
         STATS_INC(uart_tx_fast_path_hits);
         DEMO_LOG("Peer UART fast-path: id=%u len=%u rx_to_queue=%u us", frame_id, len, rx_to_queue_us);
@@ -597,7 +585,8 @@ static void on_connect_state_changed(uint16_t conn_id, const sle_addr_t *addr,
 {
     errcode_t ret;
 
-    DEMO_INFO("Connect state: conn_id=%u state=%d disc_reason=0x%x", conn_id, conn_state, disc_reason);
+    DEMO_INFO("Connect state: conn_id=%u state=%d pair_state=%d disc_reason=0x%x",
+        conn_id, conn_state, pair_state, disc_reason);
 
     if (conn_state == SLE_ACB_STATE_CONNECTED) {
         sle_set_phy_t phy_param = {
@@ -610,14 +599,19 @@ static void on_connect_state_changed(uint16_t conn_id, const sle_addr_t *addr,
             .g_feedback = 0,
             .t_feedback = 0,
         };
+#if IS_SLE_CLIENT
+        ssap_exchange_info_t info = { .mtu_size = DEMO_SLE_MTU_SIZE, .version = 1 };
+#endif
 
         s_conn_id = conn_id;
         s_connected = true;
+        s_paired = (pair_state == SLE_PAIR_PAIRED);
         demo_sle_reset_peer_discovery();
         s_seek_connect_pending = false;
         demo_sle_reset_tx_state();
         demo_sle_reset_ack_state();
         demo_sle_reset_rx_state(NULL);
+        demo_uart_reset_queues();  /* Clear accumulated UART RX data before new connection */
         s_requested_conn_interval_min = demo_sle_clamp_link_interval(DEMO_SLE_CONN_INTV_MIN);
         s_requested_conn_interval_max = demo_sle_clamp_link_interval(DEMO_SLE_CONN_INTV_MAX);
         if (s_requested_conn_interval_max < s_requested_conn_interval_min) {
@@ -635,11 +629,14 @@ static void on_connect_state_changed(uint16_t conn_id, const sle_addr_t *addr,
         ret = sle_set_mcs(conn_id, 10);
         DEMO_INFO("Set MCS=10: ret=0x%x", ret);
         demo_sle_request_low_latency("connected");
-        if (IS_SLE_CLIENT && addr != NULL && pair_state == SLE_PAIR_NONE) {
+#if IS_SLE_CLIENT
+        if (addr != NULL && pair_state == SLE_PAIR_NONE) {
             ret = sle_pair_remote_device(addr);
             DEMO_INFO("Pair request: conn_id=%u ret=0x%x", conn_id, ret);
+        } else if (pair_state == SLE_PAIR_PAIRED) {
+            (void)ssapc_exchange_info_req(0, conn_id, &info);
+            DEMO_INFO("Peer already paired, start service discovery");
         }
-#if IS_SLE_CLIENT
         (void)sle_stop_seek();
 #endif
         demo_sle_log_transport("connected");
@@ -649,6 +646,7 @@ static void on_connect_state_changed(uint16_t conn_id, const sle_addr_t *addr,
             s_connected = false;
             s_paired = false;
             demo_sle_reset_peer_discovery();
+            s_client_write_handle = 0;
             s_client_write_param.handle = 0;
             s_client_write_param.data = NULL;
             s_client_write_param.data_len = 0;
@@ -976,13 +974,14 @@ static errcode_t demo_sle_send_packet(const uint8_t *data, uint16_t len)
 #else
     uint8_t *buf = s_client_tx_buf[s_client_tx_idx];
 
-    if (s_client_write_param.handle == 0U) {
+    if (s_client_write_handle == 0U) {
         return ERRCODE_SLE_FAIL;
     }
     s_client_tx_idx = (uint8_t)((s_client_tx_idx + 1U) % 4U);
     if (memcpy_s(buf, DEMO_SLE_MTU_SIZE, data, len) != EOK) {
         return ERRCODE_SLE_FAIL;
     }
+    s_client_write_param.handle = s_client_write_handle;
     s_client_write_param.type = SSAP_PROPERTY_TYPE_VALUE;
     s_client_write_param.data_len = len;
     s_client_write_param.data = buf;
@@ -1092,10 +1091,12 @@ static void on_find_property(uint8_t client_id, uint16_t conn_id, ssapc_find_pro
         (SSAP_OPERATE_INDICATION_BIT_WRITE | SSAP_OPERATE_INDICATION_BIT_WRITE_NO_RSP)) == 0U) {
         return;
     }
+    s_client_write_handle = property->handle;
     s_client_write_param.handle = property->handle;
     s_client_write_param.type = SSAP_PROPERTY_TYPE_VALUE;
     s_client_ready = true;
-    DEMO_INFO("Client TX ready: handle=%u mtu=%u", s_client_write_param.handle, s_mtu_size);
+    DEMO_INFO("Client TX ready: handle=%u mtu=%u", s_client_write_handle, s_mtu_size);
+    osal_event_write(&g_bridge_event, DEMO_EVENT_SLE_TX_DONE);
 }
 
 static void on_notification(uint8_t client_id, uint16_t conn_id, ssapc_handle_value_t *data, errcode_t status)
@@ -1126,7 +1127,9 @@ int demo_sle_init(void)
         s_requested_conn_interval_max = s_requested_conn_interval_min;
     }
     demo_sle_refresh_payload_limits();
+    DEMO_INFO("SLE init step: enable_sle begin");
     ret = enable_sle();
+    DEMO_INFO("SLE init step: enable_sle ret=0x%x", ret);
     if (ret != ERRCODE_SUCC) {
         DEMO_ERR("SLE enable failed: 0x%x", ret);
         return -1;
@@ -1134,17 +1137,30 @@ int demo_sle_init(void)
     demo_sle_refresh_local_addr();
     (void)demo_sle_apply_default_connect_param();
     DEMO_INFO("Initializing as SLE %s", IS_SLE_SERVER ? "Server" : "Client");
+    DEMO_INFO("SLE init step: register callbacks");
     ret = demo_register_callbacks();
-    if (ret != ERRCODE_SLE_SUCCESS) return -1;
+    if (ret != ERRCODE_SLE_SUCCESS) {
+        DEMO_ERR("SLE register callbacks failed: 0x%x", ret);
+        return -1;
+    }
 #if IS_SLE_SERVER
     ret = server_add_service();
-    if (ret != ERRCODE_SLE_SUCCESS) return -1;
+    if (ret != ERRCODE_SLE_SUCCESS) {
+        DEMO_ERR("SLE add service failed: 0x%x", ret);
+        return -1;
+    }
     ret = server_start_announce();
-    if (ret != ERRCODE_SLE_SUCCESS) return -1;
+    if (ret != ERRCODE_SLE_SUCCESS) {
+        DEMO_ERR("SLE start announce failed: 0x%x", ret);
+        return -1;
+    }
 #else
     osal_msleep(1000);
     ret = client_start_scan();
-    if (ret != ERRCODE_SLE_SUCCESS) return -1;
+    if (ret != ERRCODE_SLE_SUCCESS) {
+        DEMO_ERR("SLE start scan failed: 0x%x", ret);
+        return -1;
+    }
 #endif
     DEMO_INFO("SLE init OK");
     return 0;
@@ -1155,7 +1171,7 @@ bool demo_sle_is_connected(void)
 #if IS_SLE_SERVER
     return s_connected && s_paired;
 #else
-    return s_connected && s_paired && (s_client_write_param.handle != 0U);
+    return s_connected && s_paired && (s_client_write_handle != 0U);
 #endif
 }
 
@@ -1225,6 +1241,8 @@ static uint32_t demo_sle_send_control_packet(void)
     if (ret != ERRCODE_SLE_SUCCESS) {
         STATS_INC(sle_tx_fail);
         STATS_INC(sle_tx_busy_cnt);
+        DEMO_ERR("SLE control send failed: type=%u id=%u ret=0x%x",
+            s_ack_state.packet_type, s_ack_state.frame_id, ret);
         return 0;
     }
 
@@ -1269,6 +1287,8 @@ static uint32_t demo_sle_send_next_fragment(void)
     if (ret != ERRCODE_SLE_SUCCESS) {
         STATS_INC(sle_tx_fail);
         STATS_INC(sle_tx_busy_cnt);
+        DEMO_ERR("SLE data send failed: id=%u frag=%u/%u len=%u ret=0x%x",
+            s_tx_state.frame_id, (uint8_t)(hdr.frag_idx + 1U), hdr.frag_count, payload_len, ret);
         return 0;
     }
 
@@ -1281,7 +1301,6 @@ static uint32_t demo_sle_send_next_fragment(void)
         DEMO_LOG("SLE TX frame start: id=%u len=%u frags=%u queue_delay=%u us eff=%u frag=%u",
             s_tx_state.frame_id, frame->len, s_tx_state.frag_count,
             frame_delay_us, s_effective_payload, s_fragment_payload);
-        demo_sle_log_crc_audit("SLE_TX", s_tx_state.frame_id, frame->data, frame->len);
     }
 
     STATS_INC(sle_tx_fragments);
@@ -1300,15 +1319,26 @@ static uint32_t demo_sle_send_next_fragment(void)
 uint32_t demo_sle_tx_process(void)
 {
     static uint8_t s_tx_backoff = 0;
+    static uint16_t s_last_blocked_frame_id = 0;
     uint32_t total_sent = 0;
     uint8_t batch = 0;
+    const demo_frame_slot_t *pending_frame = demo_uart_rx_frame_peek();
 
     if (!demo_sle_server_can_send()) {
+        if (pending_frame != NULL && pending_frame->frame_id != s_last_blocked_frame_id) {
+            DEMO_ERR("SLE TX blocked: id=%u len=%u connected=%u paired=%u ready=%u handle=%u",
+                pending_frame->frame_id, pending_frame->len,
+                s_connected ? 1U : 0U, s_paired ? 1U : 0U,
+                s_client_ready ? 1U : 0U, s_client_write_handle);
+            s_last_blocked_frame_id = pending_frame->frame_id;
+        }
         s_tx_backoff = 0;
         demo_sle_reset_tx_state();
         demo_sle_reset_ack_state();
         return 0;
     }
+
+    s_last_blocked_frame_id = 0;
 
     demo_sle_refresh_payload_limits();
     if (s_ack_state.pending && !s_ack_state.waiting_cfm) {
@@ -1326,6 +1356,7 @@ uint32_t demo_sle_tx_process(void)
     while (batch < 4U) {
         uint32_t sent;
 
+        demo_uart_rx_poll();
         if (!s_tx_state.active && !demo_sle_prepare_tx_frame()) {
             break;
         }

@@ -683,10 +683,18 @@ void hal_uart_irq_handler(uart_bus_t uart)
     if (uart_int_reg.intr_id.intr_id == HAL_UART_INTERRUPT_RECEIVER_LINE_STATUS) {
         // read Line Status register to clear this interrupt
         volatile uint32_t line_status = hal_uart_get_error_status(uart);
+        if ((line_status & HAL_UART_PARITY_ERR) != 0) {
+            g_hal_uart_callback[uart](uart, UART_EVT_PARITY_ERR_ISR, 0);
+        }
         if ((line_status & HAL_UART_FRAME_ERR) != 0) {
             g_hal_uart_callback[uart](uart, UART_EVT_FRAME_ERR_ISR, 0);
         }
-        g_hal_uart_callback[uart](uart, UART_EVT_OVERRUN_ERR_ISR, 0);
+        if ((line_status & HAL_UART_BREAK_INTR) != 0) {
+            g_hal_uart_callback[uart](uart, UART_EVT_BREAK_ERR_ISR, 0);
+        }
+        if ((line_status & HAL_UART_OVERRUN_ERR) != 0) {
+            g_hal_uart_callback[uart](uart, UART_EVT_OVERRUN_ERR_ISR, 0);
+        }
     }
 }
 

@@ -233,6 +233,28 @@ typedef void (*uart_rx_callback_t)(const void *buffer, uint16_t length, bool err
 typedef void (*uart_rx_by_dma_callback_t)(uart_bus_t bus, const void *buffer, uint32_t length,
                                           uart_write_dma_config_t *dma_cfg);
 #endif  /* defined(CONFIG_UART_SUPPORT_INT_TRIGGER_DMA) && defined(CONFIG_UART_SUPPORT_DMA) */
+
+#if defined(CONFIG_UART_SUPPORT_DMA) && defined(CONFIG_UART_SUPPORT_RX)
+typedef bool (*uart_idle_int_receive_cb_t)(uint8_t *receive_buff, uint32_t receive_length);
+
+typedef struct uart_dma_idle_diag {
+    uint32_t publish_count;
+    uint32_t publish_bytes;
+    uint32_t publish_from_idle_cb;
+    uint32_t publish_from_soft_flush;
+    uint32_t publish_from_idle_fallback;
+    uint32_t forced_idle_request_count;
+    uint16_t last_transfer_num;
+    uint16_t last_remaining;
+    uint16_t last_received_blocks;
+    uint16_t last_received_len;
+    uint16_t last_idle_tail_len;
+    uint16_t last_combined_len;
+    uint8_t last_publish_reason;
+    uint8_t last_rx_fifo_empty;
+    uint16_t last_fifo_drain_len;
+} uart_dma_idle_diag_t;
+#endif
 #endif  /* CONFIG_UART_SUPPORT_RX */
 
 #if defined(CONFIG_UART_SUPPORT_TX)
@@ -592,8 +614,35 @@ errcode_t uapi_uart_register_read_by_dma_callback(uart_bus_t bus, uart_write_dma
  * @param  [in]  bus 串口号，参考 @ref uart_bus_t。
  * @endif
  */
-void uapi_uart_unregister_read_by_dma_callback(uart_bus_t bus);
 #endif  /* CONFIG_UART_SUPPORT_INT_TRIGGER_DMA */
+#if defined(CONFIG_UART_SUPPORT_RX)
+void uapi_uart_unregister_read_by_dma_callback(uart_bus_t bus);
+
+/**
+ * @brief Register raw RX DMA+IDLE receive callback.
+ * @note Valid only for raw RX DMA+IDLE receive path.
+ */
+errcode_t uapi_uart_dma_recv_raw_data(uart_bus_t bus, uart_write_dma_config_t *dma_cfg,
+                                      uart_idle_int_receive_cb_t callback);
+
+/**
+ * @brief Flush pending RX bytes already moved by DMA in raw RX DMA+IDLE mode.
+ * @note No-op when the bus is not in raw RX DMA+IDLE mode or no bytes are pending.
+ */
+errcode_t uapi_uart_dma_idle_flush_pending(uart_bus_t bus);
+
+/**
+ * @brief Get raw RX DMA+IDLE mode idle interrupt invoke count for one UART bus.
+ * @note This counter is reset when raw RX DMA+IDLE mode is (re)registered.
+ */
+uint32_t uapi_uart_dma_idle_get_idle_isr_count(uart_bus_t bus);
+
+/**
+ * @brief Get diagnostic snapshot for raw RX DMA+IDLE publish behavior.
+ * @note Valid only for raw RX DMA+IDLE receive path.
+ */
+errcode_t uapi_uart_dma_idle_get_diag(uart_bus_t bus, uart_dma_idle_diag_t *diag);
+#endif
 #endif  /* CONFIG_UART_SUPPORT_DMA */
 #endif  /* CONFIG_UART_SUPPORT_TX  */
 

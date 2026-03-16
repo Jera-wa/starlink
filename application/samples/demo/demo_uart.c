@@ -33,10 +33,12 @@ static volatile bool s_dma_tx_busy = false;
 static uint8_t s_uart_rx_buf[DEMO_UART_RX_BUFFER_SIZE];
 static uint16_t s_next_uart_frame_id = 1;
 static osal_mutex s_uart_tx_lock;
-#if IS_SLE_CLIENT
-static osal_task *s_uart_rx_task = NULL;
-static volatile bool s_uart_rx_task_running = false;
-#endif
+static volatile uint32_t s_uart_rx_raw_cb_count = 0;
+static volatile uint32_t s_uart_rx_raw_cb_bytes = 0;
+static volatile uint32_t s_uart_rx_raw_cb_last_len = 0;
+static volatile uint32_t s_uart_rx_overrun_err_count = 0;
+static volatile uint32_t s_uart_rx_frame_err_count = 0;
+static volatile uint32_t s_uart_rx_parity_err_count = 0;
 
 static uart_write_dma_config_t s_dma_cfg = {
     .src_width = HAL_DMA_TRANSFER_WIDTH_8,
@@ -155,6 +157,37 @@ static void demo_uart_parser_drop_stale_frame(demo_uart_frame_parser_t *parser, 
 
     STATS_INC(uart_rx_drop_frames);
     STATS_ADD(uart_rx_drop_bytes, parser->used);
+
+    /* Skip error logging for tiny residuals (≤2 bytes) — likely sender-side alignment */
+    if (parser->used <= 2U) {
+        demo_uart_parser_reset(parser);
+        return;
+    }
+
+#if IS_SLE_CLIENT
+    {
+        uart_dma_idle_diag_t diag = {0};
+        uint16_t deficit = 0;
+
+        if (parser->expected_len > parser->used) {
+            deficit = (uint16_t)(parser->expected_len - parser->used);
+        }
+        if (uapi_uart_dma_idle_get_diag(DEMO_UART_BUS, &diag) == ERRCODE_SUCC) {
+            DEMO_ERR("UART RX timeout diag: deficit=%u raw_cb=%u raw_cb_bytes=%u last_raw=%u "
+                "pub=%u bytes=%u idle_cb=%u soft=%u idle_fb=%u forced=%u "
+                "last_reason=%u xfer=%u rem=%u blocks=%u rx=%u tail=%u combined=%u fifo_empty=%u "
+                "overrun=%u frame_err=%u parity_err=%u fifo_drain=%u",
+                deficit, s_uart_rx_raw_cb_count, s_uart_rx_raw_cb_bytes, s_uart_rx_raw_cb_last_len,
+                diag.publish_count, diag.publish_bytes, diag.publish_from_idle_cb,
+                diag.publish_from_soft_flush, diag.publish_from_idle_fallback,
+                diag.forced_idle_request_count, diag.last_publish_reason, diag.last_transfer_num,
+                diag.last_remaining, diag.last_received_blocks, diag.last_received_len,
+                diag.last_idle_tail_len, diag.last_combined_len, diag.last_rx_fifo_empty,
+                s_uart_rx_overrun_err_count, s_uart_rx_frame_err_count, s_uart_rx_parity_err_count,
+                diag.last_fifo_drain_len);
+        }
+    }
+#endif
     DEMO_ERR("UART RX partial frame timeout: used=%u expected=%u raw_in=%u dropped=%u gap=%u us",
         parser->used, parser->expected_len, parser->raw_input_bytes, parser->dropped_bytes, gap_us);
     demo_uart_parser_reset(parser);
@@ -274,127 +307,45 @@ static void uart_rx_callback(const void *buffer, uint16_t length, bool error)
 }
 
 #if IS_SLE_CLIENT
-static bool demo_uart_dma_read_exact(uint8_t *buffer, uint16_t length)
+static bool uart_rx_dma_raw_callback(uint8_t *receive_buff, uint32_t receive_length)
 {
-    int32_t ret;
+    uint32_t rx_time_us;
 
-    if (buffer == NULL || length == 0U) {
-        return false;
-    }
-
-    ret = uapi_uart_read_by_dma(DEMO_UART_BUS, buffer, length, &s_rx_dma_cfg);
-    if (ret >= 0) {
+    if (receive_buff == NULL || receive_length == 0U) {
         return true;
     }
 
-    if (s_uart_rx_task_running) {
-        DEMO_ERR("UART RX DMA read failed: want=%u got=%d", length, ret);
-    }
-    return false;
+    rx_time_us = (uint32_t)uapi_systick_get_us();
+    g_demo_stats.uart_rx_timestamp_us = rx_time_us;
+    STATS_ADD(uart_rx_bytes, receive_length);
+    s_uart_rx_raw_cb_count++;
+    s_uart_rx_raw_cb_bytes += receive_length;
+    s_uart_rx_raw_cb_last_len = receive_length;
+    demo_uart_parser_feed(receive_buff, (uint16_t)receive_length, rx_time_us);
+    return true;
+}
+#endif
+
+#if IS_SLE_CLIENT
+static void uart_overrun_error_callback(uint32_t *err_info, uint32_t len)
+{
+    unused(err_info);
+    unused(len);
+    s_uart_rx_overrun_err_count++;
 }
 
-static bool demo_uart_dma_sync_header(uint8_t *header, uint16_t *total_len, uint32_t *first_byte_timestamp_us)
+static void uart_frame_error_callback(uint32_t *err_info, uint32_t len)
 {
-    uint16_t frame_len;
-
-    if (header == NULL || total_len == NULL || first_byte_timestamp_us == NULL) {
-        return false;
-    }
-
-    if (!demo_uart_dma_read_exact(header, DEMO_LOGICAL_FRAME_HEADER_SIZE)) {
-        return false;
-    }
-
-    while (s_uart_rx_task_running) {
-        if (demo_logical_frame_header_valid(header)) {
-            frame_len = demo_logical_frame_total_len(header);
-            if (frame_len >= DEMO_LOGICAL_FRAME_HEADER_SIZE &&
-                frame_len <= DEMO_LOGICAL_FRAME_MAX_SIZE) {
-                *total_len = frame_len;
-                *first_byte_timestamp_us = (uint32_t)uapi_systick_get_us();
-                return true;
-            }
-            STATS_INC(uart_rx_oversize_frames);
-            DEMO_ERR("UART RX frame length invalid: total=%u", frame_len);
-        }
-
-        STATS_INC(uart_rx_invalid_bytes);
-        header[0] = header[1];
-        header[1] = header[2];
-        header[2] = header[3];
-        if (!demo_uart_dma_read_exact(&header[3], 1)) {
-            return false;
-        }
-    }
-
-    return false;
+    unused(err_info);
+    unused(len);
+    s_uart_rx_frame_err_count++;
 }
 
-static void *demo_uart_rx_dma_task(const char *arg)
+static void uart_parity_error_callback(uint32_t *err_info, uint32_t len)
 {
-    uint8_t frame_buf[DEMO_LOGICAL_FRAME_MAX_SIZE];
-    uint8_t header[DEMO_LOGICAL_FRAME_HEADER_SIZE];
-    uint16_t frame_len;
-    uint16_t payload_len;
-    uint32_t first_byte_timestamp_us;
-    uint32_t ready_timestamp_us;
-
-    (void)arg;
-    while (s_uart_rx_task_running) {
-        if (!demo_uart_dma_sync_header(header, &frame_len, &first_byte_timestamp_us)) {
-            break;
-        }
-
-        if (memcpy_s(frame_buf, sizeof(frame_buf), header, sizeof(header)) != EOK) {
-            continue;
-        }
-
-        payload_len = (uint16_t)(frame_len - DEMO_LOGICAL_FRAME_HEADER_SIZE);
-        if (payload_len > 0U &&
-            !demo_uart_dma_read_exact(frame_buf + DEMO_LOGICAL_FRAME_HEADER_SIZE, payload_len)) {
-            break;
-        }
-
-        ready_timestamp_us = (uint32_t)uapi_systick_get_us();
-        g_demo_stats.uart_rx_timestamp_us = ready_timestamp_us;
-        STATS_ADD(uart_rx_bytes, frame_len);
-        demo_uart_queue_rx_frame(frame_buf, frame_len, first_byte_timestamp_us, ready_timestamp_us);
-    }
-
-    s_uart_rx_task_running = false;
-    return NULL;
-}
-
-static int demo_uart_start_rx_dma_task(void)
-{
-    osal_task *task_handle = NULL;
-
-    osal_kthread_lock();
-    s_uart_rx_task_running = true;
-    task_handle = osal_kthread_create((osal_kthread_handler)demo_uart_rx_dma_task, 0,
-        "DemoUartRxTask", DEMO_TASK_STACK_SIZE);
-    if (task_handle != NULL) {
-        (void)osal_kthread_set_priority(task_handle, DEMO_TASK_PRIORITY);
-        s_uart_rx_task = task_handle;
-    } else {
-        s_uart_rx_task_running = false;
-    }
-    osal_kthread_unlock();
-
-    if (task_handle == NULL) {
-        DEMO_ERR("UART RX DMA task create failed");
-        return -1;
-    }
-    return 0;
-}
-
-static void demo_uart_stop_rx_dma_task(void)
-{
-    s_uart_rx_task_running = false;
-    if (s_uart_rx_task != NULL) {
-        osal_kthread_destroy(s_uart_rx_task, 0);
-        s_uart_rx_task = NULL;
-    }
+    unused(err_info);
+    unused(len);
+    s_uart_rx_parity_err_count++;
 }
 #endif
 
@@ -461,12 +412,18 @@ int demo_uart_init(void)
     }
 
 #if IS_SLE_CLIENT
-    if (demo_uart_start_rx_dma_task() != 0) {
+    ret = uapi_uart_dma_recv_raw_data(DEMO_UART_BUS, &s_rx_dma_cfg, uart_rx_dma_raw_callback);
+    if (ret != ERRCODE_SUCC) {
+        DEMO_ERR("UART RX DMA+IDLE register failed: 0x%x", ret);
         (void)uapi_uart_deinit(DEMO_UART_BUS);
         osal_mutex_destroy(&s_uart_tx_lock);
         return -1;
     }
-    DEMO_INFO("UART init OK (UART TX, frame-aware RX, RX DMA header/body)");
+    DEMO_INFO("UART init OK (UART TX, frame-aware RX, RX DMA+IDLE)");
+    (void)uapi_uart_register_overrun_error_callback(DEMO_UART_BUS, uart_overrun_error_callback);
+    (void)uapi_uart_register_frame_error_callback(DEMO_UART_BUS, uart_frame_error_callback);
+    (void)uapi_uart_register_parity_error_callback(DEMO_UART_BUS, uart_parity_error_callback);
+    DEMO_INFO("UART error callbacks registered (overrun/frame/parity)");
 #else
     ret = uapi_uart_register_rx_callback(DEMO_UART_BUS,
         UART_RX_CONDITION_FULL_OR_SUFFICIENT_DATA_OR_IDLE,
@@ -485,11 +442,73 @@ int demo_uart_init(void)
 void demo_uart_deinit(void)
 {
 #if IS_SLE_CLIENT
-    demo_uart_stop_rx_dma_task();
+    uapi_uart_unregister_read_by_dma_callback(DEMO_UART_BUS);
 #endif
     uapi_uart_unregister_rx_callback(DEMO_UART_BUS);
     uapi_uart_deinit(DEMO_UART_BUS);
     osal_mutex_destroy(&s_uart_tx_lock);
+}
+
+void demo_uart_rx_poll(void)
+{
+#if IS_SLE_CLIENT
+    static uint32_t s_last_poll_ms = 0;
+    uint32_t now = (uint32_t)uapi_systick_get_ms();
+
+    if ((now - s_last_poll_ms) < DEMO_UART_RX_SOFT_FLUSH_POLL_MS) {
+        return;
+    }
+    s_last_poll_ms = now;
+    (void)uapi_uart_dma_idle_flush_pending(DEMO_UART_BUS);
+#endif
+}
+
+uint32_t demo_uart_get_idle_isr_count(void)
+{
+#if IS_SLE_CLIENT
+    return uapi_uart_dma_idle_get_idle_isr_count(DEMO_UART_BUS);
+#else
+    return 0U;
+#endif
+}
+
+void demo_uart_get_rx_diag(demo_uart_rx_diag_t *diag)
+{
+    if (diag == NULL) {
+        return;
+    }
+
+    (void)memset_s(diag, sizeof(*diag), 0, sizeof(*diag));
+#if IS_SLE_CLIENT
+    {
+        uart_dma_idle_diag_t uart_diag = {0};
+
+        diag->idle_isr_count = uapi_uart_dma_idle_get_idle_isr_count(DEMO_UART_BUS);
+        diag->raw_callback_count = s_uart_rx_raw_cb_count;
+        diag->raw_callback_bytes = s_uart_rx_raw_cb_bytes;
+        diag->raw_callback_last_len = s_uart_rx_raw_cb_last_len;
+        if (uapi_uart_dma_idle_get_diag(DEMO_UART_BUS, &uart_diag) == ERRCODE_SUCC) {
+            diag->publish_count = uart_diag.publish_count;
+            diag->publish_bytes = uart_diag.publish_bytes;
+            diag->publish_from_idle_cb = uart_diag.publish_from_idle_cb;
+            diag->publish_from_soft_flush = uart_diag.publish_from_soft_flush;
+            diag->publish_from_idle_fallback = uart_diag.publish_from_idle_fallback;
+            diag->forced_idle_request_count = uart_diag.forced_idle_request_count;
+            diag->last_transfer_num = uart_diag.last_transfer_num;
+            diag->last_remaining = uart_diag.last_remaining;
+            diag->last_received_blocks = uart_diag.last_received_blocks;
+            diag->last_received_len = uart_diag.last_received_len;
+            diag->last_idle_tail_len = uart_diag.last_idle_tail_len;
+            diag->last_combined_len = uart_diag.last_combined_len;
+            diag->last_publish_reason = uart_diag.last_publish_reason;
+            diag->last_rx_fifo_empty = uart_diag.last_rx_fifo_empty;
+            diag->last_fifo_drain_len = uart_diag.last_fifo_drain_len;
+        }
+        diag->overrun_error_count = s_uart_rx_overrun_err_count;
+        diag->frame_error_count = s_uart_rx_frame_err_count;
+        diag->parity_error_count = s_uart_rx_parity_err_count;
+    }
+#endif
 }
 
 void demo_uart_reset_queues(void)
@@ -498,6 +517,12 @@ void demo_uart_reset_queues(void)
     demo_frame_queue_init(&s_uart_tx_frames);
     (void)memset_s(&s_uart_rx_parser, sizeof(s_uart_rx_parser), 0, sizeof(s_uart_rx_parser));
     s_dma_tx_busy = false;
+    /* Reset RX diagnostics on connection reset */
+#if IS_SLE_CLIENT
+    s_uart_rx_raw_cb_count = 0;
+    s_uart_rx_raw_cb_bytes = 0;
+    s_uart_rx_raw_cb_last_len = 0;
+#endif
 }
 
 const demo_frame_slot_t *demo_uart_rx_frame_peek(void)

@@ -9,6 +9,7 @@
 #include "uart.h"
 #include <stdbool.h>
 #include "common_def.h"
+#include "hal_uart_v151_regs_op.h"
 #include "soc_osal.h"
 #include "securec.h"
 #if defined(CONFIG_UART_SUPPORT_DMA)
@@ -90,6 +91,32 @@ typedef struct uart_dma_trans_inf {
 
 static uart_dma_trans_inf_t g_dma_trans[UART_BUS_MAX_NUM] = { 0 };
 
+#if defined(CONFIG_UART_SUPPORT_RX)
+#define UART_DMA_IDLE_PUBLISH_REASON_NONE          0U
+#define UART_DMA_IDLE_PUBLISH_REASON_IDLE_CB       1U
+#define UART_DMA_IDLE_PUBLISH_REASON_SOFT_FLUSH    2U
+#define UART_DMA_IDLE_PUBLISH_REASON_IDLE_FALLBACK 3U
+
+typedef struct uart_rx_dma_idle_state {
+    bool enabled;
+    bool publishing;
+    bool idle_publish_seen;
+    bool pingpong_allocated;
+    uint8_t channel;
+    uint16_t transfer_num;
+    uint8_t *dma_buffer;
+    uint8_t *dma_buffer_alt;
+    uint16_t dma_buffer_size;
+    uart_write_dma_config_t dma_cfg;
+    uart_idle_int_receive_cb_t raw_callback;
+    uart_dma_idle_diag_t diag;
+    uint8_t idle_buffer[CONFIG_UART_FIFO_DEPTH];
+} uart_rx_dma_idle_state_t;
+
+static uart_rx_dma_idle_state_t g_uart_rx_dma_idle_state[UART_BUS_MAX_NUM] = { 0 };
+static volatile uint32_t g_uart_rx_dma_idle_isr_cnt[UART_BUS_MAX_NUM] = { 0 };
+#endif  /* CONFIG_UART_SUPPORT_RX */
+
 static void uart_dma_set_config(uart_bus_t bus, const uart_extra_attr_t *extra_attr);
 #endif  /* CONFIG_UART_SUPPORT_DMA */
 
@@ -103,6 +130,7 @@ typedef struct {
     uart_rx_callback_t rx_callback;                 /*!< The RX callback to make when the condition is met. */
     uart_error_callback_t parity_error_callback;    /*!< The parity error callback. */
     uart_error_callback_t frame_error_callback;     /*!< The frame error callback. */
+    uart_error_callback_t overrun_error_callback;   /*!< The overrun error callback. */
     uint8_t *rx_buffer;                             /*!< The RX data buffer. */
     uint16_t rx_buffer_size;                        /*!< The size of the receive buffer. */
     uint16_t rx_condition_size;                     /*!< The size relating the condition. */
@@ -173,6 +201,14 @@ static void uart_idle_isr(uart_bus_t bus);
 static void uart_rx_isr(uart_bus_t bus);
 
 static void uart_error_isr(uart_bus_t bus);
+#if defined(CONFIG_UART_SUPPORT_DMA)
+static int32_t uart_read_by_dma_config(uart_bus_t bus, const void *buffer, uint32_t length,
+                                       uart_write_dma_config_t *dma_cfg,
+                                       dma_ch_user_peripheral_config_t *user_cfg);
+static bool uart_rx_dma_idle_enabled(uart_bus_t bus);
+static errcode_t uart_rx_dma_idle_start(uart_bus_t bus);
+static void uart_rx_dma_idle_stop(uart_bus_t bus);
+#endif
 #endif  /* CONFIG_UART_SUPPORT_RX */
 
 #if defined(CONFIG_UART_SUPPORT_TX_INT)
@@ -531,6 +567,9 @@ errcode_t uapi_uart_deinit(uart_bus_t bus)
     if (!g_uart_inited[bus]) {
         return ERRCODE_SUCC;
     }
+#if defined(CONFIG_UART_SUPPORT_DMA) && defined(CONFIG_UART_SUPPORT_RX)
+    uapi_uart_unregister_read_by_dma_callback(bus);
+#endif
     ret = hal_uart_deinit(bus);
 
     uart_port_unregister_irq(bus);
@@ -654,6 +693,19 @@ errcode_t uapi_uart_register_frame_error_callback(uart_bus_t bus, uart_error_cal
 
     return ret;
 }
+
+errcode_t uapi_uart_register_overrun_error_callback(uart_bus_t bus, uart_error_callback_t callback)
+{
+    if (bus >= UART_BUS_MAX_NUM || callback == NULL) {
+        return ERRCODE_INVALID_PARAM;
+    }
+    uart_rx_state_t *rx_state = &g_uart_rx_state_array[bus];
+    uint32_t irq_sts = uart_porting_lock(bus);
+    rx_state->overrun_error_callback = callback;
+    uart_porting_unlock(bus, irq_sts);
+
+    return ERRCODE_SUCC;
+}
 #endif  /* CONFIG_UART_SUPPORT_RX */
 
 static int32_t uapi_uart_param_check(uart_bus_t bus, const uint8_t *buffer, uint32_t length)
@@ -758,6 +810,223 @@ static void uart_dma_set_config(uart_bus_t bus, const uart_extra_attr_t *extra_a
     (void)osal_sem_init(&(g_dma_trans[bus].dma_sem), 0);
     g_dma_trans[bus].inited = true;
 }
+
+#if defined(CONFIG_UART_SUPPORT_RX)
+static bool uart_rx_dma_idle_enabled(uart_bus_t bus)
+{
+    if (bus >= UART_BUS_MAX_NUM) {
+        return false;
+    }
+    return g_uart_rx_dma_idle_state[bus].enabled;
+}
+
+static void uart_rx_dma_idle_dma_isr(uint8_t int_type, uint8_t ch, uintptr_t arg)
+{
+    unused(ch);
+    unused(arg);
+    unused(int_type);
+}
+
+static errcode_t uart_rx_dma_idle_start(uart_bus_t bus)
+{
+    uart_rx_dma_idle_state_t *state = &g_uart_rx_dma_idle_state[bus];
+    dma_ch_user_peripheral_config_t user_cfg = {0};
+    uint8_t dma_ch;
+    int32_t ret;
+
+    if ((state->dma_buffer == NULL) || (state->dma_buffer_size == 0U)) {
+        return ERRCODE_INVALID_PARAM;
+    }
+
+    ret = uart_read_by_dma_config(bus, state->dma_buffer, state->dma_buffer_size, &state->dma_cfg, &user_cfg);
+    if (ret != ERRCODE_SUCC) {
+        return (errcode_t)ret;
+    }
+    if (user_cfg.src_handshaking == HAL_DMA_HANDSHAKING_MAX_NUM) {
+        return ERRCODE_FAIL;
+    }
+
+    ret = uapi_dma_configure_peripheral_transfer_single(&user_cfg, &dma_ch,
+        uart_rx_dma_idle_dma_isr, (uintptr_t)bus);
+    if (ret != ERRCODE_SUCC) {
+        return (errcode_t)ret;
+    }
+
+    state->channel = (uint8_t)(dma_ch + 1U);
+    state->transfer_num = user_cfg.transfer_num;
+    ret = uapi_dma_start_transfer(dma_ch);
+    if (ret != ERRCODE_SUCC) {
+        state->channel = 0;
+        return (errcode_t)ret;
+    }
+
+    return ERRCODE_SUCC;
+}
+
+static uart_bus_t uart_rx_dma_idle_find_bus_by_buffer(const void *buffer)
+{
+    uart_bus_t bus;
+
+    for (bus = UART_BUS_0; bus < UART_BUS_MAX_NUM; bus++) {
+        uart_rx_dma_idle_state_t *state = &g_uart_rx_dma_idle_state[bus];
+        if (state->enabled && buffer == state->idle_buffer) {
+            return bus;
+        }
+    }
+    return UART_BUS_MAX_NUM;
+}
+
+static void uart_rx_dma_idle_restore_rx_buffer(uart_bus_t bus)
+{
+    uart_rx_state_t *rx_state = &g_uart_rx_state_array[bus];
+    uart_rx_dma_idle_state_t *state = &g_uart_rx_dma_idle_state[bus];
+
+    rx_state->rx_buffer = state->dma_buffer;
+    rx_state->rx_buffer_size = state->dma_buffer_size;
+    rx_state->new_rx_pos = 0;
+}
+
+static void uart_rx_dma_idle_prepare_idle_buffer(uart_bus_t bus);
+
+static void uart_rx_dma_idle_publish(uart_bus_t bus, uint16_t idle_tail_len, uint8_t reason)
+{
+    uart_rx_dma_idle_state_t *state;
+    uint16_t remaining;
+    uint16_t received_blocks;
+    uint16_t received_len;
+    uint16_t combined_len;
+    uint16_t fifo_drain = 0;
+    uint8_t channel;
+    uint8_t *completed_buf;
+    bool keep_receiving = true;
+    bool fifo_empty = false;
+
+    if (bus >= UART_BUS_MAX_NUM) {
+        return;
+    }
+
+    state = &g_uart_rx_dma_idle_state[bus];
+    if (!state->enabled || state->publishing || (state->channel == 0U) ||
+        (state->dma_buffer == NULL) || (state->dma_buffer_size == 0U)) {
+        return;
+    }
+
+    state->publishing = true;
+    state->idle_publish_seen = true;
+    channel = (uint8_t)(state->channel - 1U);
+    (void)uapi_dma_end_transfer(channel);
+    state->channel = 0;
+    remaining = (uint16_t)uapi_dma_get_block_ts(channel);
+    if (remaining > state->transfer_num) {
+        remaining = state->transfer_num;
+    }
+
+    received_blocks = (uint16_t)(state->transfer_num - remaining);
+    received_len = (uint16_t)(received_blocks << state->dma_cfg.src_width);
+    if (received_len > state->dma_buffer_size) {
+        received_len = state->dma_buffer_size;
+    }
+
+    /* Save pointer to completed buffer before swapping */
+    completed_buf = state->dma_buffer;
+
+    /* Drain FIFO residual bytes into completed buffer tail — minimizes overrun window */
+    (void)hal_uart_ctrl(bus, UART_CTRL_CHECK_RX_FIFO_EMPTY, (uintptr_t)&fifo_empty);
+    while (!fifo_empty && ((uint32_t)received_len + fifo_drain) < state->dma_buffer_size) {
+        hal_uart_read(bus, &completed_buf[received_len + fifo_drain], 1);
+        fifo_drain++;
+        (void)hal_uart_ctrl(bus, UART_CTRL_CHECK_RX_FIFO_EMPTY, (uintptr_t)&fifo_empty);
+    }
+
+    /* Ping-pong: swap to alternate buffer and restart DMA immediately */
+    if (state->dma_buffer_alt != NULL) {
+        state->dma_buffer = state->dma_buffer_alt;
+        state->dma_buffer_alt = completed_buf;
+        uart_rx_dma_idle_prepare_idle_buffer(bus);
+        if (uart_rx_dma_idle_start(bus) != ERRCODE_SUCC) {
+            state->enabled = false;
+        }
+    }
+
+    /* Append idle tail (from ISR path) to completed buffer after FIFO drain */
+    combined_len = (uint16_t)(received_len + fifo_drain);
+    if ((idle_tail_len > 0U) && (combined_len < state->dma_buffer_size)) {
+        uint16_t tail_len = idle_tail_len;
+        if ((uint32_t)combined_len + tail_len > state->dma_buffer_size) {
+            tail_len = (uint16_t)(state->dma_buffer_size - combined_len);
+        }
+        (void)memcpy_s(completed_buf + combined_len, state->dma_buffer_size - combined_len,
+            state->idle_buffer, tail_len);
+        combined_len = (uint16_t)(combined_len + tail_len);
+    }
+
+    state->diag.publish_count++;
+    state->diag.publish_bytes += combined_len;
+    state->diag.last_transfer_num = state->transfer_num;
+    state->diag.last_remaining = remaining;
+    state->diag.last_received_blocks = received_blocks;
+    state->diag.last_received_len = received_len;
+    state->diag.last_idle_tail_len = idle_tail_len;
+    state->diag.last_combined_len = combined_len;
+    state->diag.last_publish_reason = reason;
+    state->diag.last_fifo_drain_len = fifo_drain;
+    if (reason == UART_DMA_IDLE_PUBLISH_REASON_IDLE_CB) {
+        state->diag.publish_from_idle_cb++;
+    } else if (reason == UART_DMA_IDLE_PUBLISH_REASON_SOFT_FLUSH) {
+        state->diag.publish_from_soft_flush++;
+    } else if (reason == UART_DMA_IDLE_PUBLISH_REASON_IDLE_FALLBACK) {
+        state->diag.publish_from_idle_fallback++;
+    }
+
+    if ((combined_len > 0U) && (state->raw_callback != NULL)) {
+        keep_receiving = state->raw_callback(completed_buf, combined_len);
+    }
+    if (!keep_receiving) {
+        state->enabled = false;
+    }
+
+    /* Fallback: if no alt buffer, restart DMA the old way (after callback) */
+    if (state->dma_buffer_alt == NULL && state->enabled) {
+        uart_rx_dma_idle_prepare_idle_buffer(bus);
+        if (uart_rx_dma_idle_start(bus) != ERRCODE_SUCC) {
+            state->enabled = false;
+        }
+    }
+
+    state->publishing = false;
+}
+
+static void uart_rx_dma_idle_prepare_idle_buffer(uart_bus_t bus)
+{
+    uart_rx_state_t *rx_state = &g_uart_rx_state_array[bus];
+    uart_rx_dma_idle_state_t *state = &g_uart_rx_dma_idle_state[bus];
+
+    rx_state->rx_buffer = state->idle_buffer;
+    rx_state->rx_buffer_size = CONFIG_UART_FIFO_DEPTH;
+    rx_state->new_rx_pos = 0;
+}
+
+static void uart_rx_dma_idle_rx_callback(const void *buffer, uint16_t length, bool error)
+{
+    uart_bus_t bus = uart_rx_dma_idle_find_bus_by_buffer(buffer);
+
+    unused(error);
+    if (bus >= UART_BUS_MAX_NUM) {
+        return;
+    }
+    uart_rx_dma_idle_publish(bus, length, UART_DMA_IDLE_PUBLISH_REASON_IDLE_CB);
+}
+
+static void uart_rx_dma_idle_stop(uart_bus_t bus)
+{
+    uart_rx_dma_idle_state_t *state = &g_uart_rx_dma_idle_state[bus];
+
+    if (state->channel != 0U) {
+        (void)uapi_dma_end_transfer((uint8_t)(state->channel - 1U));
+        state->channel = 0;
+    }
+}
+#endif  /* CONFIG_UART_SUPPORT_RX */
 
 static void uart_dma_isr(uint8_t int_type, uint8_t ch, uintptr_t arg)
 {
@@ -929,6 +1198,226 @@ int32_t uapi_uart_read_by_dma(uart_bus_t bus, const void *buffer, uint32_t lengt
     }
 
     return (int32_t)uapi_dma_get_block_ts(dma_ch);
+}
+
+errcode_t uapi_uart_register_read_by_dma_callback(uart_bus_t bus, uart_write_dma_config_t *dma_cfg)
+{
+#if defined(CONFIG_UART_SUPPORT_RX)
+    uart_rx_state_t *rx_state = &g_uart_rx_state_array[bus];
+    uart_rx_dma_idle_state_t *state = &g_uart_rx_dma_idle_state[bus];
+    uint32_t irq_sts;
+    errcode_t ret;
+
+    if ((bus >= UART_BUS_MAX_NUM) || (dma_cfg == NULL) || !g_uart_inited[bus]) {
+        return ERRCODE_INVALID_PARAM;
+    }
+
+    irq_sts = uart_porting_lock(bus);
+    state->enabled = false;
+    state->publishing = false;
+    state->idle_publish_seen = false;
+    state->channel = 0;
+    state->transfer_num = 0;
+    (void)memset_s(&state->diag, sizeof(state->diag), 0, sizeof(state->diag));
+    state->dma_buffer = rx_state->rx_buffer;
+    state->dma_buffer_size = rx_state->rx_buffer_size;
+    state->raw_callback = NULL;
+    if ((state->dma_buffer == NULL) || (state->dma_buffer_size == 0U)) {
+        uart_porting_unlock(bus, irq_sts);
+        return ERRCODE_INVALID_PARAM;
+    }
+    (void)memcpy_s(&state->dma_cfg, sizeof(state->dma_cfg), dma_cfg, sizeof(*dma_cfg));
+    ret = uart_rx_dma_idle_start(bus);
+    if (ret != ERRCODE_SUCC) {
+        uart_porting_unlock(bus, irq_sts);
+        return ret;
+    }
+    state->enabled = true;
+    uart_porting_unlock(bus, irq_sts);
+    return ERRCODE_SUCC;
+#else
+    unused(bus);
+    unused(dma_cfg);
+    return ERRCODE_NOT_SUPPORT;
+#endif
+}
+
+errcode_t uapi_uart_dma_recv_raw_data(uart_bus_t bus, uart_write_dma_config_t *dma_cfg,
+                                      uart_idle_int_receive_cb_t callback)
+{
+#if defined(CONFIG_UART_SUPPORT_RX)
+    uart_rx_state_t *rx_state = &g_uart_rx_state_array[bus];
+    uart_rx_dma_idle_state_t *state = &g_uart_rx_dma_idle_state[bus];
+    uint32_t irq_sts;
+    errcode_t ret;
+
+    if ((bus >= UART_BUS_MAX_NUM) || (dma_cfg == NULL) || (callback == NULL) || !g_uart_inited[bus]) {
+        return ERRCODE_INVALID_PARAM;
+    }
+
+    irq_sts = uart_porting_lock(bus);
+    state->enabled = false;
+    state->publishing = false;
+    state->idle_publish_seen = false;
+    state->pingpong_allocated = false;
+    state->channel = 0;
+    state->transfer_num = 0;
+    g_uart_rx_dma_idle_isr_cnt[bus] = 0;
+    (void)memset_s(&state->diag, sizeof(state->diag), 0, sizeof(state->diag));
+    state->dma_buffer = rx_state->rx_buffer;
+    state->dma_buffer_size = rx_state->rx_buffer_size;
+    state->dma_buffer_alt = (uint8_t *)osal_kmalloc(rx_state->rx_buffer_size, OSAL_GFP_KERNEL);
+    if (state->dma_buffer_alt == NULL) {
+        uart_porting_unlock(bus, irq_sts);
+        return ERRCODE_MALLOC;
+    }
+    state->pingpong_allocated = true;
+    state->raw_callback = callback;
+    (void)memcpy_s(&state->dma_cfg, sizeof(state->dma_cfg), dma_cfg, sizeof(*dma_cfg));
+    uart_rx_dma_idle_prepare_idle_buffer(bus);
+    ret = uart_rx_dma_idle_start(bus);
+    if (ret != ERRCODE_SUCC) {
+        uart_rx_dma_idle_restore_rx_buffer(bus);
+        osal_kfree(state->dma_buffer_alt);
+        state->dma_buffer_alt = NULL;
+        state->pingpong_allocated = false;
+        uart_porting_unlock(bus, irq_sts);
+        return ret;
+    }
+    state->enabled = true;
+    uart_porting_unlock(bus, irq_sts);
+    ret = uapi_uart_register_rx_callback(bus, UART_RX_CONDITION_MASK_IDLE,
+        CONFIG_UART_FIFO_DEPTH, uart_rx_dma_idle_rx_callback);
+    if (ret != ERRCODE_SUCC) {
+        irq_sts = uart_porting_lock(bus);
+        state->enabled = false;
+        uart_rx_dma_idle_stop(bus);
+        uart_rx_dma_idle_restore_rx_buffer(bus);
+        osal_kfree(state->dma_buffer_alt);
+        state->dma_buffer_alt = NULL;
+        state->pingpong_allocated = false;
+        uart_porting_unlock(bus, irq_sts);
+        return ret;
+    }
+    return ERRCODE_SUCC;
+#else
+    unused(bus);
+    unused(dma_cfg);
+    unused(callback);
+    return ERRCODE_NOT_SUPPORT;
+#endif
+}
+
+errcode_t uapi_uart_dma_idle_flush_pending(uart_bus_t bus)
+{
+#if defined(CONFIG_UART_SUPPORT_RX)
+    uart_rx_dma_idle_state_t *state;
+    uint16_t remaining;
+    uint16_t received_blocks;
+    uint8_t channel;
+    bool rx_fifo_empty = true;
+
+    if (bus >= UART_BUS_MAX_NUM) {
+        return ERRCODE_INVALID_PARAM;
+    }
+
+    state = &g_uart_rx_dma_idle_state[bus];
+    if (!state->enabled || state->publishing || (state->channel == 0U) || (state->raw_callback == NULL)) {
+        return ERRCODE_SUCC;
+    }
+
+    channel = (uint8_t)(state->channel - 1U);
+    remaining = (uint16_t)uapi_dma_get_block_ts(channel);
+    if (remaining > state->transfer_num) {
+        remaining = state->transfer_num;
+    }
+    received_blocks = (uint16_t)(state->transfer_num - remaining);
+    (void)hal_uart_ctrl(bus, UART_CTRL_CHECK_RX_FIFO_EMPTY, (uintptr_t)&rx_fifo_empty);
+    state->diag.last_rx_fifo_empty = rx_fifo_empty ? 1U : 0U;
+    if ((received_blocks == 0U) && rx_fifo_empty) {
+        return ERRCODE_SUCC;
+    }
+
+    /* If FIFO still holds tail bytes, route through the IDLE ISR path so the
+       tail is merged from idle_buffer instead of being truncated. */
+    if (!rx_fifo_empty) {
+        state->diag.forced_idle_request_count++;
+        hal_uart_force_idle_isr(bus);
+        return ERRCODE_SUCC;
+    }
+
+    uart_rx_dma_idle_publish(bus, 0U, UART_DMA_IDLE_PUBLISH_REASON_SOFT_FLUSH);
+    return ERRCODE_SUCC;
+#else
+    unused(bus);
+    return ERRCODE_NOT_SUPPORT;
+#endif
+}
+
+uint32_t uapi_uart_dma_idle_get_idle_isr_count(uart_bus_t bus)
+{
+#if defined(CONFIG_UART_SUPPORT_RX)
+    if (bus >= UART_BUS_MAX_NUM) {
+        return 0U;
+    }
+    return g_uart_rx_dma_idle_isr_cnt[bus];
+#else
+    unused(bus);
+    return 0U;
+#endif
+}
+
+errcode_t uapi_uart_dma_idle_get_diag(uart_bus_t bus, uart_dma_idle_diag_t *diag)
+{
+#if defined(CONFIG_UART_SUPPORT_RX)
+    uart_rx_dma_idle_state_t *state;
+    uint32_t irq_sts;
+
+    if ((bus >= UART_BUS_MAX_NUM) || (diag == NULL)) {
+        return ERRCODE_INVALID_PARAM;
+    }
+
+    state = &g_uart_rx_dma_idle_state[bus];
+    irq_sts = uart_porting_lock(bus);
+    (void)memcpy_s(diag, sizeof(*diag), &state->diag, sizeof(state->diag));
+    uart_porting_unlock(bus, irq_sts);
+    return ERRCODE_SUCC;
+#else
+    unused(bus);
+    unused(diag);
+    return ERRCODE_NOT_SUPPORT;
+#endif
+}
+
+void uapi_uart_unregister_read_by_dma_callback(uart_bus_t bus)
+{
+#if defined(CONFIG_UART_SUPPORT_RX)
+    uart_rx_dma_idle_state_t *state;
+    uart_rx_state_t *rx_state;
+    uint32_t irq_sts;
+
+    if (bus >= UART_BUS_MAX_NUM) {
+        return;
+    }
+
+    state = &g_uart_rx_dma_idle_state[bus];
+    rx_state = &g_uart_rx_state_array[bus];
+    irq_sts = uart_porting_lock(bus);
+    state->enabled = false;
+    state->raw_callback = NULL;
+    uart_rx_dma_idle_stop(bus);
+    if (state->pingpong_allocated && state->dma_buffer_alt != NULL) {
+        osal_kfree(state->dma_buffer_alt);
+        state->dma_buffer_alt = NULL;
+        state->pingpong_allocated = false;
+    }
+    rx_state->rx_buffer = state->dma_buffer;
+    rx_state->rx_buffer_size = state->dma_buffer_size;
+    rx_state->new_rx_pos = 0;
+    uart_porting_unlock(bus, irq_sts);
+#else
+    unused(bus);
+#endif
 }
 #endif  /* CONFIG_UART_SUPPORT_DMA */
 #endif  /* CONFIG_UART_SUPPORT_TX */
@@ -1387,10 +1876,26 @@ static errcode_t uart_evt_callback(uart_bus_t bus, hal_uart_evt_id_t evt, uintpt
 
 #if defined(CONFIG_UART_SUPPORT_RX)
         case UART_EVT_RX_ISR:
+#if defined(CONFIG_UART_SUPPORT_DMA)
+            if (uart_rx_dma_idle_enabled(bus)) {
+                break;
+            }
+#endif
             uart_rx_isr(bus);
             break;
 
         case UART_EVT_IDLE_ISR:
+#if defined(CONFIG_UART_SUPPORT_DMA)
+            if (uart_rx_dma_idle_enabled(bus)) {
+                g_uart_rx_dma_idle_isr_cnt[bus]++;
+                g_uart_rx_dma_idle_state[bus].idle_publish_seen = false;
+                uart_idle_isr(bus);
+                if (uart_rx_dma_idle_enabled(bus) && !g_uart_rx_dma_idle_state[bus].idle_publish_seen) {
+                    uart_rx_dma_idle_publish(bus, 0, UART_DMA_IDLE_PUBLISH_REASON_IDLE_FALLBACK);
+                }
+                break;
+            }
+#endif
             uart_idle_isr(bus);
             break;
 
@@ -1412,9 +1917,15 @@ static errcode_t uart_evt_callback(uart_bus_t bus, hal_uart_evt_id_t evt, uintpt
             uart_error_isr(bus);
             break;
 
+        case UART_EVT_OVERRUN_ERR_ISR:
+            if (rx_state->overrun_error_callback != NULL) {
+                rx_state->overrun_error_callback(NULL, 0);
+            }
+            uart_error_isr(bus);
+            break;
+
 #endif  /* CONFIG_UART_SUPPORT_RX */
         default :
-/* 为保证UT覆盖到default分支，UART_EVT_OVERRUN_ERR_ISR分支与default分支合并 */
 #if defined(CONFIG_UART_SUPPORT_RX)
             uart_error_isr(bus);
 #endif  /* CONFIG_UART_SUPPORT_RX */
@@ -1490,6 +2001,12 @@ void uapi_uart_unregister_rx_callback(uart_bus_t bus)
     }
     uint32_t irq_sts = uart_porting_lock(bus);
     uart_rx_state_t *rx_state = &g_uart_rx_state_array[bus];
+#if defined(CONFIG_UART_SUPPORT_DMA)
+    uart_rx_dma_idle_state_t *dma_state = &g_uart_rx_dma_idle_state[bus];
+    dma_state->enabled = false;
+    uart_rx_dma_idle_stop(bus);
+    uart_rx_dma_idle_restore_rx_buffer(bus);
+#endif
     rx_state->rx_callback = NULL;
     hal_uart_ctrl(bus, UART_CTRL_EN_RX_INT, 0);
     hal_uart_ctrl(bus, UART_CTRL_EN_FRAME_ERR_INT, 0);
