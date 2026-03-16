@@ -1,3 +1,17 @@
 .deveco/**
 .vscode/**
 
+build/
+dist/
+out/
+bin/
+obj/
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.exe
+*.log
+.worktrees/
