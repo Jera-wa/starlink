@@ -19,7 +19,7 @@
 #define DEMO_EVENT_ALL                                                         \
   (DEMO_EVENT_UART_RX | DEMO_EVENT_SLE_RX | DEMO_EVENT_SLE_TX_DONE)
 
-#define DEMO_EVENT_TIMEOUT_MS 2
+#define DEMO_EVENT_TIMEOUT_MS 1
 
 extern osal_event g_bridge_event;
 
@@ -36,12 +36,26 @@ extern "C" {
 #define DEMO_UART_RX_PIN CONFIG_UART_RXD_PIN
 
 /*============================================================================
+ * DMA LLI Circular RX Configuration (client only)
+ *============================================================================*/
+#define DEMO_DMA_LLI_BLOCK_SIZE 1024U
+#define DEMO_DMA_LLI_BLOCK_COUNT 8U
+#define DEMO_DMA_LLI_RING_SIZE                                                 \
+  (DEMO_DMA_LLI_BLOCK_SIZE * DEMO_DMA_LLI_BLOCK_COUNT) /* 8192 */
+
+/*============================================================================
  * Logical Frame / Queue Configuration
  *============================================================================*/
+#if defined(CONFIG_DEMO_SLE_CLIENT)
+#define DEMO_UART_RX_BUFFER_SIZE DEMO_DMA_LLI_RING_SIZE
+#else
 #define DEMO_UART_RX_BUFFER_SIZE DEMO_LOGICAL_FRAME_MAX_SIZE
+#endif
 #define DEMO_UART_RX_THRESHOLD 16
 #define DEMO_UART_TX_BUFFER_SIZE 4096
-#define DEMO_UART_FRAME_GAP_TIMEOUT_US 50000U
+#define DEMO_UART_RAW_CHUNK_QUEUE_DEPTH 8U
+#define DEMO_UART_RAW_CHUNK_SLOT_SIZE DEMO_DMA_LLI_BLOCK_SIZE
+#define DEMO_UART_FRAME_GAP_TIMEOUT_US 200000U
 
 #define DEMO_LOGICAL_FRAME_MAX_SIZE 2304
 #define DEMO_FRAME_QUEUE_DEPTH 6
@@ -235,14 +249,14 @@ extern demo_stats_t g_demo_stats;
  * Role Check Macros
  *============================================================================*/
 #if defined(CONFIG_DEMO_SLE_SERVER)
-#define IS_SLE_SERVER   1
-#define IS_SLE_CLIENT   0
+#define IS_SLE_SERVER 1
+#define IS_SLE_CLIENT 0
 #elif defined(CONFIG_DEMO_SLE_CLIENT)
-#define IS_SLE_SERVER   0
-#define IS_SLE_CLIENT   1
+#define IS_SLE_SERVER 0
+#define IS_SLE_CLIENT 1
 #else
-#define IS_SLE_SERVER   1
-#define IS_SLE_CLIENT   0
+#define IS_SLE_SERVER 1
+#define IS_SLE_CLIENT 0
 #endif
 
 #ifdef __cplusplus
