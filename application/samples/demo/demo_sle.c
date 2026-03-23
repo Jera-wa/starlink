@@ -289,7 +289,6 @@ static bool demo_sle_server_can_send(void)
 static void demo_sle_reset_tx_state(void)
 {
     demo_transport_reset_tx(&s_tx_state);
-    g_demo_stats.sle_tx_start_us = 0;
 }
 
 static void demo_sle_reset_ack_state(void)
@@ -360,6 +359,9 @@ static void demo_sle_record_sle_delivery(const uint8_t *data, uint16_t len, uint
         frame_id, len, reassembly_us, max_gap_us);
     if (demo_uart_tx_direct_frame(data, len, frame_id, first_rx_us, ready_timestamp_us, reassembly_us)) {
         STATS_INC(uart_tx_fast_path_hits);
+#if IS_SLE_SERVER
+        DEMO_INFO("T4 id=%u t=%u", frame_id, (uint32_t)uapi_systick_get_us());
+#endif
         DEMO_LOG("Peer UART fast-path: id=%u len=%u rx_to_queue=%u us", frame_id, len, rx_to_queue_us);
         return;
     }
@@ -378,7 +380,6 @@ static void demo_sle_record_sle_delivery(const uint8_t *data, uint16_t len, uint
 static void demo_sle_complete_active_frame(uint16_t frame_id, bool acked)
 {
     const demo_frame_slot_t *frame = s_tx_state.frame;
-    uint32_t now_us = (uint32_t)uapi_systick_get_us();
 
     if (!s_tx_state.active || frame == NULL || s_tx_state.frame_id != frame_id) {
         DEMO_LOG("ACK ignored: id=%u active=%u current=%u",
@@ -391,17 +392,9 @@ static void demo_sle_complete_active_frame(uint16_t frame_id, bool acked)
     }
     STATS_ADD(sle_tx_bytes, frame->len);
     STATS_INC(sle_tx_frames);
-    if (g_demo_stats.sle_tx_start_us > 0U && now_us >= g_demo_stats.sle_tx_start_us) {
-        uint32_t rtt_us = now_us - g_demo_stats.sle_tx_start_us;
-        STATS_UPDATE_RANGE(sle_rtt_us_min, sle_rtt_us_max, sle_rtt_us_sum, sle_rtt_count, rtt_us);
-        DEMO_LOG("Peer SLE delivery %s: id=%u len=%u retries=%u rtt=%u us",
-            acked ? "ACK" : "indication-complete",
-            frame_id, frame->len, s_tx_state.retry_count, rtt_us);
-    } else {
-        DEMO_LOG("Peer SLE delivery %s: id=%u len=%u retries=%u",
-            acked ? "ACK" : "indication-complete",
-            frame_id, frame->len, s_tx_state.retry_count);
-    }
+    DEMO_LOG("Peer SLE delivery %s: id=%u len=%u retries=%u",
+        acked ? "ACK" : "indication-complete",
+        frame_id, frame->len, s_tx_state.retry_count);
     demo_uart_rx_frame_consume();
     demo_sle_reset_tx_state();
     osal_event_write(&g_bridge_event, DEMO_EVENT_SLE_TX_DONE);
@@ -463,12 +456,13 @@ static void demo_sle_handle_rx_payload(const uint8_t *data, uint16_t len)
         return;
     }
 
-    g_demo_stats.sle_rx_timestamp_us = rx_time_us;
-
     if (!demo_sle_frag_decode(data, len, &hdr)) {
         if (len <= DEMO_LOGICAL_FRAME_MAX_SIZE &&
             demo_logical_frame_header_valid(data) &&
             demo_logical_frame_total_len(data) == len) {
+#if IS_SLE_SERVER
+            DEMO_INFO("T3 len=%u t=%u", len, rx_time_us);
+#endif
             demo_sle_record_sle_delivery(data, len, 0, 1U, rx_time_us, 0, 0);
             return;
         }
@@ -494,6 +488,12 @@ static void demo_sle_handle_rx_payload(const uint8_t *data, uint16_t len)
             DEMO_ERR("Unknown transport packet dropped: type=%u len=%u", hdr.type, len);
             return;
     }
+
+#if IS_SLE_SERVER
+    if (hdr.frag_idx == 0U) {
+        DEMO_INFO("T3 len=%u t=%u", len, rx_time_us);
+    }
+#endif
 
     STATS_INC(sle_rx_fragments);
     if (demo_sle_handle_duplicate_frame(&hdr)) {
@@ -543,8 +543,6 @@ static void demo_sle_handle_rx_payload(const uint8_t *data, uint16_t len)
 
     if (hdr.frag_idx > 0U && rx_time_us >= s_rx_state.last_fragment_us) {
         uint32_t gap_us = rx_time_us - s_rx_state.last_fragment_us;
-        STATS_UPDATE_RANGE(intra_frame_gap_us_min, intra_frame_gap_us_max,
-            intra_frame_gap_us_sum, intra_frame_gap_count, gap_us);
         if (gap_us > s_rx_state.max_gap_us) {
             s_rx_state.max_gap_us = gap_us;
         }
@@ -1295,9 +1293,9 @@ static uint32_t demo_sle_send_next_fragment(void)
     now_us = (uint32_t)uapi_systick_get_us();
     if (s_tx_state.offset == 0U && frame->enqueue_timestamp_us > 0U && now_us >= frame->enqueue_timestamp_us) {
         uint32_t frame_delay_us = now_us - frame->enqueue_timestamp_us;
-        g_demo_stats.sle_tx_start_us = now_us;
-        STATS_UPDATE_RANGE(frame_tx_delay_us_min, frame_tx_delay_us_max,
-            frame_tx_delay_us_sum, frame_tx_delay_count, frame_delay_us);
+#if IS_SLE_CLIENT
+        DEMO_INFO("T2 id=%u t=%u", s_tx_state.frame_id, now_us);
+#endif
         DEMO_LOG("SLE TX frame start: id=%u len=%u frags=%u queue_delay=%u us eff=%u frag=%u",
             s_tx_state.frame_id, frame->len, s_tx_state.frag_count,
             frame_delay_us, s_effective_payload, s_fragment_payload);
@@ -1318,7 +1316,6 @@ static uint32_t demo_sle_send_next_fragment(void)
 
 uint32_t demo_sle_tx_process(void)
 {
-    static uint8_t s_tx_backoff = 0;
     static uint16_t s_last_blocked_frame_id = 0;
     uint32_t total_sent = 0;
     uint8_t batch = 0;
@@ -1332,7 +1329,6 @@ uint32_t demo_sle_tx_process(void)
                 s_client_ready ? 1U : 0U, s_client_write_handle);
             s_last_blocked_frame_id = pending_frame->frame_id;
         }
-        s_tx_backoff = 0;
         demo_sle_reset_tx_state();
         demo_sle_reset_ack_state();
         return 0;
@@ -1340,16 +1336,10 @@ uint32_t demo_sle_tx_process(void)
 
     s_last_blocked_frame_id = 0;
 
-    demo_sle_refresh_payload_limits();
     if (s_ack_state.pending && !s_ack_state.waiting_cfm) {
         return demo_sle_send_control_packet();
     }
     if (!demo_sle_is_connected() || s_fragment_payload == 0U) {
-        return 0;
-    }
-
-    if (s_tx_backoff > 0U) {
-        s_tx_backoff--;
         return 0;
     }
 
@@ -1363,7 +1353,6 @@ uint32_t demo_sle_tx_process(void)
 
         sent = demo_sle_send_next_fragment();
         if (sent == 0U) {
-            s_tx_backoff = 1U;
             break;
         }
         total_sent += sent;

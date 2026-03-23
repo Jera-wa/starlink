@@ -5,7 +5,6 @@
 
 #include "demo_uart.h"
 #include "demo_config.h"
-#include "demo_sle.h"
 #include "hal_uart.h"
 #include "securec.h"
 #include "soc_osal.h"
@@ -52,7 +51,8 @@ static demo_uart_frame_parser_t s_uart_rx_parser;
 static uint8_t s_dma_tx_buf[DEMO_TX_BUFFER_COUNT][DEMO_DMA_CHUNK_SIZE];
 static volatile uint8_t s_dma_tx_idx = 0;
 static volatile bool s_dma_tx_busy = false;
-static uint8_t s_uart_rx_buf[DEMO_UART_RX_BUFFER_SIZE];
+static uint8_t s_uart_rx_buf[DEMO_UART_RX_BUFFER_SIZE]
+    __attribute__((aligned(32)));
 static uint16_t s_next_uart_frame_id = 1;
 static osal_mutex s_uart_tx_lock;
 static volatile uint32_t s_uart_rx_raw_cb_count = 0;
@@ -156,27 +156,6 @@ static void demo_uart_queue_rx_frame(const uint8_t *data, uint16_t len,
     queue_count = demo_frame_queue_count(&s_uart_rx_frames);
     osal_irq_restore(irq_sts);
 
-#if IS_SLE_CLIENT
-    if (!queued && demo_sle_is_connected()) {
-        uint8_t retry = 0U;
-
-        while (retry < DEMO_FRAME_QUEUE_DEPTH) {
-            if (demo_sle_tx_process() == 0U) {
-                break;
-            }
-            irq_sts = osal_irq_lock();
-            queued = demo_frame_queue_push(&s_uart_rx_frames, data, len, frame_id,
-                enqueue_timestamp_us, ready_timestamp_us, 0U);
-            queue_count = demo_frame_queue_count(&s_uart_rx_frames);
-            osal_irq_restore(irq_sts);
-            if (queued) {
-                break;
-            }
-            retry++;
-        }
-    }
-#endif
-
     if (!queued) {
         STATS_INC(uart_rx_drop_frames);
         STATS_ADD(uart_rx_drop_bytes, len);
@@ -186,22 +165,12 @@ static void demo_uart_queue_rx_frame(const uint8_t *data, uint16_t len,
     }
 
     STATS_INC(uart_rx_frames);
+#if IS_SLE_CLIENT
+    DEMO_INFO("T1 id=%u t=%u", frame_id, (uint32_t)uapi_systick_get_us());
+#endif
     STATS_SET_HWM(uart_rx_ring_hwm, queue_count);
     DEMO_LOG("UART RX frame queued: id=%u len=%u q=%u", frame_id, len, queue_count);
     osal_event_write(&g_bridge_event, DEMO_EVENT_UART_RX);
-
-#if IS_SLE_CLIENT
-    /* In LLI mode a single raw chunk can contain many tiny logical frames.
-       Drain toward SLE before the fixed-depth frame queue overflows. */
-    while (queue_count >= (DEMO_FRAME_QUEUE_DEPTH - 1U) && demo_sle_is_connected()) {
-        if (demo_sle_tx_process() == 0U) {
-            break;
-        }
-        irq_sts = osal_irq_lock();
-        queue_count = demo_frame_queue_count(&s_uart_rx_frames);
-        osal_irq_restore(irq_sts);
-    }
-#endif
 }
 
 #if IS_SLE_CLIENT
@@ -783,7 +752,6 @@ static void uart_rx_callback(const void *buffer, uint16_t length, bool error)
     }
 
     rx_time_us = (uint32_t)uapi_systick_get_us();
-    g_demo_stats.uart_rx_timestamp_us = rx_time_us;
     STATS_ADD(uart_rx_bytes, length);
     demo_uart_parser_feed((const uint8_t *)buffer, length, rx_time_us);
 }
@@ -813,7 +781,6 @@ static bool uart_rx_dma_raw_callback(uint8_t *receive_buff, uint32_t receive_len
         }
     }
     s_uart_rx_last_enqueue_us = rx_time_us;
-    g_demo_stats.uart_rx_timestamp_us = rx_time_us;
     STATS_ADD(uart_rx_bytes, receive_length);
     s_uart_rx_raw_cb_count++;
     s_uart_rx_raw_cb_bytes += receive_length;
@@ -974,17 +941,22 @@ void demo_uart_deinit(void)
     osal_mutex_destroy(&s_uart_tx_lock);
 }
 
-void demo_uart_rx_poll(void)
+uint32_t demo_uart_rx_poll(void)
 {
 #if IS_SLE_CLIENT
     static uint32_t s_last_poll_ms = 0;
+    uint32_t processed = 0;
     uint32_t now = (uint32_t)uapi_systick_get_ms();
 
     if ((now - s_last_poll_ms) < DEMO_UART_RX_SOFT_FLUSH_POLL_MS) {
-        return;
+        return 0U;
     }
     s_last_poll_ms = now;
     (void)uapi_uart_dma_idle_flush_pending(DEMO_UART_BUS);
+    processed = demo_uart_rx_process_raw_chunks();
+    return processed;
+#else
+    return 0U;
 #endif
 }
 
@@ -1190,40 +1162,11 @@ bool demo_uart_tx_can_fast_path(void)
     return !s_dma_tx_busy && demo_frame_queue_is_empty(&s_uart_tx_frames);
 }
 
-static void demo_uart_record_tx_complete(uint16_t frame_id, uint16_t len,
-    uint32_t enqueue_timestamp_us, uint32_t ready_timestamp_us, uint32_t stage_duration_us,
-    uint32_t tx_start_us, uint32_t now_us, bool fast_path)
+static void demo_uart_record_tx_complete(uint16_t frame_id, uint16_t len, bool fast_path)
 {
-    uint32_t delivery_us = 0;
-    uint32_t reassembly_us = 0;
-    uint32_t uart_queue_wait_us = 0;
-    uint32_t uart_submit_us = 0;
-
-    if (enqueue_timestamp_us > 0 && now_us >= enqueue_timestamp_us) {
-        delivery_us = now_us - enqueue_timestamp_us;
-        STATS_UPDATE_RANGE(frame_rx_delay_us_min, frame_rx_delay_us_max,
-            frame_rx_delay_us_sum, frame_rx_delay_count, delivery_us);
-    }
-    if (stage_duration_us > 0U) {
-        reassembly_us = stage_duration_us;
-        STATS_UPDATE_RANGE(sle_reassembly_us_min, sle_reassembly_us_max,
-            sle_reassembly_us_sum, sle_reassembly_count, reassembly_us);
-    }
-    if (ready_timestamp_us > 0 && tx_start_us >= ready_timestamp_us) {
-        uart_queue_wait_us = tx_start_us - ready_timestamp_us;
-        STATS_UPDATE_RANGE(uart_queue_wait_us_min, uart_queue_wait_us_max,
-            uart_queue_wait_us_sum, uart_queue_wait_count, uart_queue_wait_us);
-    }
-    if (now_us >= tx_start_us) {
-        uart_submit_us = now_us - tx_start_us;
-        STATS_UPDATE_RANGE(uart_submit_us_min, uart_submit_us_max,
-            uart_submit_us_sum, uart_submit_count, uart_submit_us);
-    }
-
     STATS_INC(uart_tx_frames);
-    DEMO_LOG("UART TX frame complete: id=%u len=%u reassembly=%u us queue_wait=%u us submit=%u us delivery=%u us%s",
-        frame_id, len, reassembly_us, uart_queue_wait_us, uart_submit_us, delivery_us,
-        fast_path ? " fast=1" : "");
+    DEMO_LOG("UART TX frame complete: id=%u len=%u%s",
+        frame_id, len, fast_path ? " fast=1" : "");
 }
 
 uint32_t demo_uart_tx_send(const uint8_t *data, uint32_t len)
@@ -1278,9 +1221,11 @@ int32_t demo_uart_tx_direct(const uint8_t *data, uint16_t len)
 bool demo_uart_tx_direct_frame(const uint8_t *data, uint16_t len, uint16_t frame_id,
     uint32_t enqueue_timestamp_us, uint32_t ready_timestamp_us, uint32_t stage_duration_us)
 {
-    uint32_t tx_start_us;
-    uint32_t now_us;
     uint32_t sent;
+
+    unused(enqueue_timestamp_us);
+    unused(ready_timestamp_us);
+    unused(stage_duration_us);
 
     if (!demo_uart_tx_can_fast_path()) {
         return false;
@@ -1293,16 +1238,13 @@ bool demo_uart_tx_direct_frame(const uint8_t *data, uint16_t len, uint16_t frame
         return false;
     }
 
-    tx_start_us = (uint32_t)uapi_systick_get_us();
     sent = demo_uart_tx_send(data, len);
     osal_mutex_unlock(&s_uart_tx_lock);
     if (sent != len) {
         return false;
     }
 
-    now_us = (uint32_t)uapi_systick_get_us();
-    demo_uart_record_tx_complete(frame_id, len, enqueue_timestamp_us, ready_timestamp_us,
-        stage_duration_us, tx_start_us, now_us, true);
+    demo_uart_record_tx_complete(frame_id, len, true);
     return true;
 }
 
@@ -1321,8 +1263,6 @@ uint32_t demo_uart_tx_process(void)
     }
 
     while (batch < DEMO_MAX_DMA_PER_LOOP) {
-        uint32_t tx_start_us;
-        uint32_t now_us;
         uint32_t sent;
 
         /* Copy frame out under IRQ lock (matches push-side locking) */
@@ -1336,17 +1276,13 @@ uint32_t demo_uart_tx_process(void)
         demo_frame_queue_consume(&s_uart_tx_frames);
         osal_irq_restore(irq_sts);
 
-        tx_start_us = (uint32_t)uapi_systick_get_us();
         sent = demo_uart_tx_send(local_slot.data, local_slot.len);
         if (sent != local_slot.len) {
             STATS_INC(uart_tx_drop_frames);
             break;
         }
 
-        now_us = (uint32_t)uapi_systick_get_us();
-        demo_uart_record_tx_complete(local_slot.frame_id, local_slot.len,
-            local_slot.enqueue_timestamp_us, local_slot.ready_timestamp_us,
-            local_slot.stage_duration_us, tx_start_us, now_us, false);
+        demo_uart_record_tx_complete(local_slot.frame_id, local_slot.len, false);
 
         total_sent += sent;
         batch++;
