@@ -6,6 +6,7 @@ import os
 import shutil
 import sys
 import time
+import re
 
 from utils.build_utils import exec_shell, root_path, output_root, sdk_output_path, pkg_tools_path
 from utils.build_utils import compare_bin
@@ -45,14 +46,24 @@ class CMakeBuilder(BuildEnvironment):
                     components.append(comm)
         return components
 
+    def get_make_program(self, env):
+        output_path = env.get_output_path()
+        cache_path = os.path.join(output_path, 'CMakeCache.txt')
+        if os.path.exists(cache_path):
+            with open(cache_path, 'r', encoding='utf-8', errors='ignore') as cache_file:
+                for line in cache_file:
+                    match = re.match(r'^CMAKE_MAKE_PROGRAM:FILEPATH=(.+)$', line.strip())
+                    if match:
+                        make_program = match.group(1)
+                        if os.path.exists(make_program):
+                            return make_program
+        return 'ninja' if self.generator == 'Ninja' else 'make'
+
     def get_build_cmd(self, env):
         ext_cmd = []
         components = self.get_component(env)
         ext_cmd.extend(components)
-        if self.generator == 'Ninja':
-            return ['ninja'] + ext_cmd + ['-j%d' % self.thread]
-        else:
-            return ['make'] + ext_cmd + ['-j%d' % self.thread]
+        return [self.get_make_program(env)] + ext_cmd + ['-j%d' % self.thread]
 
     def build(self):
         """

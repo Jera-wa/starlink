@@ -19,7 +19,7 @@
 #define UUID_INDEX              14
 #define BT_INDEX_4              4
 #define BT_INDEX_0              0
-#define UART_BUFF_LENGTH        0x100
+#define UART_BUFF_LENGTH        520  /* 对齐 MTU，允许单次发送 ~500B，减少分片 */
 
 /* 广播ID */
 #define SLE_ADV_HANDLE_DEFAULT  1
@@ -281,12 +281,15 @@ errcode_t sle_uart_server_send_report_by_uuid(const uint8_t *data, uint8_t len)
 errcode_t sle_uart_server_send_report_by_handle(const uint8_t *data, uint16_t len)
 {
     ssaps_ntf_ind_t param = {0};
-    uint8_t receive_buf[UART_BUFF_LENGTH] = { 0 }; /* max receive length. */
+    uint8_t receive_buf[UART_BUFF_LENGTH] = { 0 }; /* max send length. */
     param.handle = g_property_handle;
     param.type = SSAP_PROPERTY_TYPE_VALUE;
     param.value = receive_buf;
     param.value_len = len;
-    if (memcpy_s(param.value, param.value_len, data, len) != EOK) {
+    if (len > sizeof(receive_buf)) {
+        return ERRCODE_SLE_FAIL;
+    }
+    if (memcpy_s(param.value, sizeof(receive_buf), data, len) != EOK) {
         return ERRCODE_SLE_FAIL;
     }
     return ssaps_notify_indicate(g_server_id, g_sle_conn_hdl, &param);

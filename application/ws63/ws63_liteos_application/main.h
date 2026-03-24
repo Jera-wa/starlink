@@ -22,7 +22,11 @@ __attribute__((section(".text.runtime.init"))) void runtime_init(void);
 
 extern void LOS_PrepareMainTask(void);
 
-#ifdef WIFI_TASK_EXIST
+#if defined(WIFI_TASK_EXIST) && !defined(CONFIG_ENABLE_DEMO_SAMPLE)
+#define APP_WIFI_RUNTIME_ENABLED
+#endif
+
+#ifdef APP_WIFI_RUNTIME_ENABLED
 extern int wifi_host_task(void *param);
 extern __attribute__((weak)) int demo_init(void *param);
 #endif

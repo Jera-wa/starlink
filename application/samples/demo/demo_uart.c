@@ -138,7 +138,7 @@ static uint16_t demo_uart_next_frame_id(void)
 }
 
 static void demo_uart_queue_rx_frame(const uint8_t *data, uint16_t len,
-    uint32_t enqueue_timestamp_us, uint32_t ready_timestamp_us)
+    uint32_t enqueue_timestamp_us, uint32_t ready_timestamp_us, uint32_t last_byte_timestamp_us)
 {
     uint16_t frame_id;
     uint8_t queued;
@@ -166,7 +166,24 @@ static void demo_uart_queue_rx_frame(const uint8_t *data, uint16_t len,
 
     STATS_INC(uart_rx_frames);
 #if IS_SLE_CLIENT
-    DEMO_INFO("T1 id=%u t=%u", frame_id, (uint32_t)uapi_systick_get_us());
+    {
+        uint32_t t0_t1_us = 0U;
+        uint32_t t0_tlast_us = 0U;
+        uint32_t tlast_t1_us = 0U;
+
+        if (ready_timestamp_us >= enqueue_timestamp_us) {
+            t0_t1_us = ready_timestamp_us - enqueue_timestamp_us;
+        }
+        if (last_byte_timestamp_us >= enqueue_timestamp_us) {
+            t0_tlast_us = last_byte_timestamp_us - enqueue_timestamp_us;
+        }
+        if (ready_timestamp_us >= last_byte_timestamp_us) {
+            tlast_t1_us = ready_timestamp_us - last_byte_timestamp_us;
+        }
+
+        DEMO_INFO("T1 id=%u t=%u len=%u t0_t1=%u t0_tlast=%u tlast_t1=%u",
+            frame_id, ready_timestamp_us, len, t0_t1_us, t0_tlast_us, tlast_t1_us);
+    }
 #endif
     STATS_SET_HWM(uart_rx_ring_hwm, queue_count);
     DEMO_LOG("UART RX frame queued: id=%u len=%u q=%u", frame_id, len, queue_count);
@@ -344,7 +361,7 @@ static void demo_uart_format_bytes_hex(const uint8_t *data, uint8_t length, char
 static uint32_t demo_uart_frame_gap_timeout_us(void)
 {
     uint32_t jitter_margin_us =
-        (DEMO_UART_RX_SOFT_FLUSH_POLL_MS + DEMO_EVENT_TIMEOUT_MS) * 1000U;
+        DEMO_UART_RX_SOFT_FLUSH_POLL_US + (DEMO_EVENT_TIMEOUT_MS * 1000U);
     return DEMO_UART_FRAME_GAP_TIMEOUT_US + jitter_margin_us;
 }
 
@@ -617,7 +634,7 @@ static void demo_uart_queue_ingress_frame(demo_uart_frame_parser_t *parser, uint
     }
 
     demo_uart_queue_rx_frame(parser->buffer, parser->expected_len,
-        parser->first_byte_timestamp_us, ready_timestamp_us);
+        parser->first_byte_timestamp_us, ready_timestamp_us, parser->last_byte_timestamp_us);
 
     if (s_uart_rx_timeout_consecutive > 0U) {
         DEMO_INFO("UART RX timeout burst recovered: burst=%u", s_uart_rx_timeout_consecutive);
@@ -760,7 +777,7 @@ static void uart_rx_callback(const void *buffer, uint16_t length, bool error)
 static bool uart_rx_dma_raw_callback(uint8_t *receive_buff, uint32_t receive_length)
 {
     uint32_t rx_time_us;
-    uint32_t gap_us;
+    uint32_t gap_us = 0U;
 
     if (receive_buff == NULL || receive_length == 0U) {
         return true;
@@ -944,14 +961,14 @@ void demo_uart_deinit(void)
 uint32_t demo_uart_rx_poll(void)
 {
 #if IS_SLE_CLIENT
-    static uint32_t s_last_poll_ms = 0;
+    static uint32_t s_last_poll_us = 0;
     uint32_t processed = 0;
-    uint32_t now = (uint32_t)uapi_systick_get_ms();
+    uint32_t now = (uint32_t)uapi_systick_get_us();
 
-    if ((now - s_last_poll_ms) < DEMO_UART_RX_SOFT_FLUSH_POLL_MS) {
+    if ((now - s_last_poll_us) < DEMO_UART_RX_SOFT_FLUSH_POLL_US) {
         return 0U;
     }
-    s_last_poll_ms = now;
+    s_last_poll_us = now;
     (void)uapi_uart_dma_idle_flush_pending(DEMO_UART_BUS);
     processed = demo_uart_rx_process_raw_chunks();
     return processed;
@@ -979,6 +996,18 @@ uint32_t demo_uart_rx_process_raw_chunks(void)
     return processed;
 #else
     return 0U;
+#endif
+}
+
+bool demo_uart_rx_has_pending_work(void)
+{
+#if IS_SLE_CLIENT
+    if (s_uart_rx_parser.used > 0U) {
+        return true;
+    }
+    return s_uart_rx_raw_chunks.head != s_uart_rx_raw_chunks.tail;
+#else
+    return false;
 #endif
 }
 

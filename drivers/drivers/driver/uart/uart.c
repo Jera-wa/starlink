@@ -108,6 +108,7 @@ static uart_dma_trans_inf_t g_dma_trans[UART_BUS_MAX_NUM] = {0};
 #define UART_DMA_IDLE_PUBLISH_REASON_SOFT_FLUSH 2U
 #define UART_DMA_IDLE_PUBLISH_REASON_IDLE_FALLBACK 3U
 #define UART_DMA_IDLE_PUBLISH_REASON_DMA_COMPLETE 4U
+#define UART_DCACHE_LINE_SIZE 32U
 #define UART_DMA_LLI_ROLLOVER_FLAG_WRAP BIT(0)
 #define UART_DMA_LLI_ROLLOVER_FLAG_REGRESS BIT(1)
 
@@ -1166,6 +1167,15 @@ static bool uart_rx_dma_idle_queue_lli_active_partial(uart_bus_t bus,
 
   partial_len = (uint16_t)(state->lli_block_size -
                            (remaining << state->dma_cfg.src_width));
+#ifdef CONFIG_SUPPORT_DATA_CACHE
+  /* Never publish the cache line DMA may still be updating. Leave the tail to
+     the next soft-flush or the DMA-complete path. */
+  if (partial_len >
+      (uint16_t)(state->lli_active_block_published + UART_DCACHE_LINE_SIZE)) {
+    partial_len =
+        (uint16_t)(partial_len & ~(uint16_t)(UART_DCACHE_LINE_SIZE - 1U));
+  }
+#endif
   if ((partial_len > state->lli_block_size) ||
       (partial_len <= state->lli_active_block_published)) {
     state->lli_last_remaining = remaining;
@@ -1961,6 +1971,19 @@ errcode_t uapi_uart_dma_recv_raw_data(uart_bus_t bus,
   uart_porting_unlock(bus, irq_sts);
 #if defined(CONFIG_DMA_SUPPORT_LLI)
   if (state->lli_mode) {
+    irq_sts = uart_porting_lock(bus);
+    ret = hal_uart_ctrl(bus, UART_CTRL_EN_IDLE_INT, 1);
+    uart_porting_unlock(bus, irq_sts);
+    if (ret != ERRCODE_SUCC) {
+      irq_sts = uart_porting_lock(bus);
+      state->enabled = false;
+      uart_rx_dma_idle_stop(bus);
+      state->lli_mode = false;
+      state->lli_block_size = 0U;
+      state->lli_block_count = 0U;
+      uart_porting_unlock(bus, irq_sts);
+      return ret;
+    }
     return ERRCODE_SUCC;
   }
 #endif
@@ -2015,15 +2038,40 @@ errcode_t uapi_uart_dma_idle_flush_pending(uart_bus_t bus) {
     return ERRCODE_SUCC;
   }
   if (state->lli_mode) {
+    uint16_t cur;
+
+    if (state->publishing) {
+      osal_irq_restore(irq_sts);
+      return ERRCODE_SUCC;
+    }
+    channel = (uint8_t)(state->channel - 1U);
+    cur = (uint16_t)uapi_dma_get_block_ts(channel);
+    if (cur > state->transfer_num) {
+      cur = state->transfer_num;
+    }
     (void)hal_uart_ctrl(bus, UART_CTRL_CHECK_RX_FIFO_EMPTY,
                         (uintptr_t)&rx_fifo_empty);
     state->diag.last_rx_fifo_empty = rx_fifo_empty ? 1U : 0U;
+    if (rx_fifo_empty) {
+      state->idle_debounce_armed = false;
+      osal_irq_restore(irq_sts);
+      uart_rx_dma_idle_publish(bus, 0U, UART_DMA_IDLE_PUBLISH_REASON_SOFT_FLUSH);
+      return ERRCODE_SUCC;
+    }
+    if (!state->idle_debounce_armed) {
+      state->idle_debounce_armed = true;
+      state->idle_debounce_remaining = cur;
+      osal_irq_restore(irq_sts);
+      return ERRCODE_SUCC;
+    }
+    if (cur == state->idle_debounce_remaining) {
+      state->idle_debounce_armed = false;
+      osal_irq_restore(irq_sts);
+      uart_rx_dma_idle_publish(bus, 0U, UART_DMA_IDLE_PUBLISH_REASON_SOFT_FLUSH);
+      return ERRCODE_SUCC;
+    }
+    state->idle_debounce_remaining = cur;
     osal_irq_restore(irq_sts);
-    /* LLI partial publishes are safe as long as we only expose bytes that DMA
-       has already written into the active block. Waiting for FIFO-empty here
-       coalesces many tiny frames into a full block and overflows the demo
-       queue. */
-    uart_rx_dma_idle_publish(bus, 0U, UART_DMA_IDLE_PUBLISH_REASON_SOFT_FLUSH);
     return ERRCODE_SUCC;
   }
   if (state->publishing) {

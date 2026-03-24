@@ -18,7 +18,7 @@ endif()
 set(Python3_EXECUTABLE ${PY_PATH})
 find_program(CCACHE_FOUND ccache)
 if(CCACHE_FOUND)
-    set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE ccache)
+    set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE "${CCACHE_FOUND}")
 endif(CCACHE_FOUND)
 
 # default hso module_name & AUTO_DEF_FILE_ID & AUTO_DEF_MODULE_ID, redefine these var in sub cmake file will

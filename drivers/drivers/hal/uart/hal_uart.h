@@ -403,6 +403,17 @@ typedef int32_t (*hal_uart_read_t)(uart_bus_t bus, const uint8_t *data, uint16_t
 
 /**
  * @if Eng
+ * @brief  Force the pending execution of the UART idle ISR path.
+ * @param  [in]  bus The uart bus. see @ref uart_bus_t
+ * @else
+ * @brief  强制触发UART的IDLE ISR路径。
+ * @param  [in]  bus 串口号，参考 @ref uart_bus_t
+ * @endif
+ */
+void hal_uart_force_idle_isr(uart_bus_t bus);
+
+/**
+ * @if Eng
  * @brief  Configuring DMA Transmission interface for hal uart.
  * @param  [in]  bus The device pointer to manager the hal uart.
  * @param  [in]  extra_attr High-level configuration of uart. see @ref hal_uart_extra_attr_t.

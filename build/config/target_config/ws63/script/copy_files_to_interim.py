@@ -40,9 +40,6 @@ if __name__ == '__main__':
         if not os.path.isfile(src_file):
             print(f'[!][copy_files_to_interim] File `{src_file}` not found, will skip it !')
             continue
-        filename = src_file.split('/')[-1]
-        if not os.path.isfile(os.path.join(target_dir, filename)):
-            continue
         try:
             shutil.copy(src_file, dest)
         except BaseException as e:

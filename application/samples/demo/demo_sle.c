@@ -359,9 +359,6 @@ static void demo_sle_record_sle_delivery(const uint8_t *data, uint16_t len, uint
         frame_id, len, reassembly_us, max_gap_us);
     if (demo_uart_tx_direct_frame(data, len, frame_id, first_rx_us, ready_timestamp_us, reassembly_us)) {
         STATS_INC(uart_tx_fast_path_hits);
-#if IS_SLE_SERVER
-        DEMO_INFO("T4 id=%u t=%u", frame_id, (uint32_t)uapi_systick_get_us());
-#endif
         DEMO_LOG("Peer UART fast-path: id=%u len=%u rx_to_queue=%u us", frame_id, len, rx_to_queue_us);
         return;
     }
@@ -460,9 +457,6 @@ static void demo_sle_handle_rx_payload(const uint8_t *data, uint16_t len)
         if (len <= DEMO_LOGICAL_FRAME_MAX_SIZE &&
             demo_logical_frame_header_valid(data) &&
             demo_logical_frame_total_len(data) == len) {
-#if IS_SLE_SERVER
-            DEMO_INFO("T3 len=%u t=%u", len, rx_time_us);
-#endif
             demo_sle_record_sle_delivery(data, len, 0, 1U, rx_time_us, 0, 0);
             return;
         }
@@ -488,12 +482,6 @@ static void demo_sle_handle_rx_payload(const uint8_t *data, uint16_t len)
             DEMO_ERR("Unknown transport packet dropped: type=%u len=%u", hdr.type, len);
             return;
     }
-
-#if IS_SLE_SERVER
-    if (hdr.frag_idx == 0U) {
-        DEMO_INFO("T3 len=%u t=%u", len, rx_time_us);
-    }
-#endif
 
     STATS_INC(sle_rx_fragments);
     if (demo_sle_handle_duplicate_frame(&hdr)) {
@@ -1294,7 +1282,17 @@ static uint32_t demo_sle_send_next_fragment(void)
     if (s_tx_state.offset == 0U && frame->enqueue_timestamp_us > 0U && now_us >= frame->enqueue_timestamp_us) {
         uint32_t frame_delay_us = now_us - frame->enqueue_timestamp_us;
 #if IS_SLE_CLIENT
-        DEMO_INFO("T2 id=%u t=%u", s_tx_state.frame_id, now_us);
+        uint32_t parser_to_queue_us = 0U;
+        uint32_t queue_to_sle_us = 0U;
+
+        if (frame->ready_timestamp_us > 0U && frame->ready_timestamp_us >= frame->enqueue_timestamp_us) {
+            parser_to_queue_us = frame->ready_timestamp_us - frame->enqueue_timestamp_us;
+        }
+        if (frame->ready_timestamp_us > 0U && now_us >= frame->ready_timestamp_us) {
+            queue_to_sle_us = now_us - frame->ready_timestamp_us;
+        }
+        DEMO_INFO("T2 id=%u t=%u t0_t1=%u t1_t2=%u t0_t2=%u",
+            s_tx_state.frame_id, now_us, parser_to_queue_us, queue_to_sle_us, frame_delay_us);
 #endif
         DEMO_LOG("SLE TX frame start: id=%u len=%u frags=%u queue_delay=%u us eff=%u frag=%u",
             s_tx_state.frame_id, frame->len, s_tx_state.frag_count,

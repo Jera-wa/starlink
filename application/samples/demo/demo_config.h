@@ -69,8 +69,8 @@ extern "C" {
 #define DEMO_SLE_LINK_INTERVAL_MIN_LEGAL 0x0010
 #define DEMO_SLE_LINK_INTERVAL_MAX_LEGAL 0x7D00
 
-#define DEMO_SLE_CONN_INTV_MIN 0x0010
-#define DEMO_SLE_CONN_INTV_MAX 0x0010
+#define DEMO_SLE_CONN_INTV_MIN 0x000A
+#define DEMO_SLE_CONN_INTV_MAX 0x000A
 
 #define DEMO_SLE_ADV_INTERVAL_MIN 0x00C8
 #define DEMO_SLE_ADV_INTERVAL_MAX 0x00C8
@@ -101,7 +101,7 @@ extern "C" {
 #define DEMO_TASK_PRIORITY 20
 #define DEMO_TASK_STACK_SIZE 0x1200
 #define DEMO_BRIDGE_POLL_MS 1
-#define DEMO_UART_RX_SOFT_FLUSH_POLL_MS 1
+#define DEMO_UART_RX_SOFT_FLUSH_POLL_US 400U
 
 /*============================================================================
  * Debug Configuration
@@ -115,8 +115,18 @@ extern "C" {
 #define DEMO_LOG(fmt, ...)
 #endif
 
-#define DEMO_INFO(fmt, ...) osal_printk("[DEMO] " fmt "\r\n", ##__VA_ARGS__)
-#define DEMO_ERR(fmt, ...) osal_printk("[DEMO ERR] " fmt "\r\n", ##__VA_ARGS__)
+#define DEMO_INFO(fmt, ...)                                                    \
+  do {                                                                         \
+    if (0) {                                                                   \
+      osal_printk("[DEMO] " fmt "\r\n", ##__VA_ARGS__);                        \
+    }                                                                          \
+  } while (0)
+#define DEMO_ERR(fmt, ...)                                                     \
+  do {                                                                         \
+    if (0) {                                                                   \
+      osal_printk("[DEMO ERR] " fmt "\r\n", ##__VA_ARGS__);                    \
+    }                                                                          \
+  } while (0)
 
 /*============================================================================
  * Statistics Structure
@@ -170,53 +180,7 @@ typedef struct {
   volatile uint8_t sle_low_latency_status;
   volatile uint8_t sle_low_latency_rate;
 
-  volatile uint32_t loop_stall_ms_max;
   volatile uint32_t loop_count;
-
-  volatile uint32_t time_uart_to_sle_us;
-  volatile uint32_t time_sle_tx_us;
-  volatile uint32_t time_sle_to_uart_us;
-  volatile uint32_t time_uart_tx_us;
-  volatile uint32_t timing_sample_count;
-
-  volatile uint32_t sle_rtt_us_min;
-  volatile uint32_t sle_rtt_us_max;
-  volatile uint32_t sle_rtt_us_sum;
-  volatile uint32_t sle_rtt_count;
-
-  volatile uint32_t uart_rx_timestamp_us;
-  volatile uint32_t sle_rx_timestamp_us;
-  volatile uint32_t sle_tx_start_us;
-
-  volatile uint32_t frame_tx_delay_us_min;
-  volatile uint32_t frame_tx_delay_us_max;
-  volatile uint32_t frame_tx_delay_us_sum;
-  volatile uint32_t frame_tx_delay_count;
-
-  volatile uint32_t frame_rx_delay_us_min;
-  volatile uint32_t frame_rx_delay_us_max;
-  volatile uint32_t frame_rx_delay_us_sum;
-  volatile uint32_t frame_rx_delay_count;
-
-  volatile uint32_t sle_reassembly_us_min;
-  volatile uint32_t sle_reassembly_us_max;
-  volatile uint32_t sle_reassembly_us_sum;
-  volatile uint32_t sle_reassembly_count;
-
-  volatile uint32_t uart_queue_wait_us_min;
-  volatile uint32_t uart_queue_wait_us_max;
-  volatile uint32_t uart_queue_wait_us_sum;
-  volatile uint32_t uart_queue_wait_count;
-
-  volatile uint32_t uart_submit_us_min;
-  volatile uint32_t uart_submit_us_max;
-  volatile uint32_t uart_submit_us_sum;
-  volatile uint32_t uart_submit_count;
-
-  volatile uint32_t intra_frame_gap_us_min;
-  volatile uint32_t intra_frame_gap_us_max;
-  volatile uint32_t intra_frame_gap_us_sum;
-  volatile uint32_t intra_frame_gap_count;
 
   volatile uint32_t start_tick;
 } demo_stats_t;

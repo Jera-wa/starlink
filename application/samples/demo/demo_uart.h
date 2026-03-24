@@ -97,6 +97,7 @@ void demo_uart_deinit(void);
 void demo_uart_reset_queues(void);
 uint32_t demo_uart_rx_poll(void);
 uint32_t demo_uart_rx_process_raw_chunks(void);
+bool demo_uart_rx_has_pending_work(void);
 uint32_t demo_uart_get_idle_isr_count(void);
 void demo_uart_get_rx_diag(demo_uart_rx_diag_t *diag);
 

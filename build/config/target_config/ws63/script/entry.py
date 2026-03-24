@@ -43,10 +43,16 @@ def do_cmd(target_name: str, hook_name: str, env: Dict[str, Any])->bool:
     if not os.path.isfile(os.path.join(root_path, "output", "ws63", "acore", "boot_bin", "flashboot.bin")) and target_name not in target_array and hook_name == 'build_pre':
         print("flashboot start build .....")
         errcode = exec_shell([python_path, 'build.py', 'ws63-flashboot'], None, True)
+        if errcode != 0:
+            print("flashboot build failed!")
+            return False
 
     if not os.path.isfile(os.path.join(root_path, "output", "ws63", "acore", "boot_bin", "loaderboot.bin")) and target_name not in target_array and hook_name == 'build_pre':
         print("loaderboot start build .....")
         errcode = exec_shell([python_path, 'build.py', 'ws63-loaderboot'], None, True)
+        if errcode != 0:
+            print("loaderboot build failed!")
+            return False
     
     if hook_name == 'build_pre':
         return True

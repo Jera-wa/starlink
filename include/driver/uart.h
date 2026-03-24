@@ -243,7 +243,14 @@ typedef struct uart_dma_idle_diag {
     uint32_t publish_from_idle_cb;
     uint32_t publish_from_soft_flush;
     uint32_t publish_from_idle_fallback;
+    uint32_t publish_from_dma_complete;
     uint32_t forced_idle_request_count;
+    uint32_t deferred_publish_set_count;
+    uint32_t deferred_publish_drained_count;
+    uint32_t last_publish_seq;
+    uint32_t last_dma_complete_seq;
+    uint32_t last_deferred_publish_set_seq;
+    uint32_t last_deferred_publish_drained_seq;
     uint16_t last_transfer_num;
     uint16_t last_remaining;
     uint16_t last_received_blocks;
@@ -253,6 +260,25 @@ typedef struct uart_dma_idle_diag {
     uint8_t last_publish_reason;
     uint8_t last_rx_fifo_empty;
     uint16_t last_fifo_drain_len;
+    uint32_t lli_rollover_count;
+    uint32_t lli_rollover_wrap_count;
+    uint32_t lli_rollover_regress_count;
+    uint32_t lli_last_rollover_publish_seq;
+    uint16_t lli_last_rollover_block;
+    uint16_t lli_last_rollover_prev_published;
+    uint16_t lli_last_rollover_partial_len;
+    uint16_t lli_last_rollover_prev_remaining;
+    uint16_t lli_last_rollover_remaining;
+    uint16_t lli_last_rollover_queue_offset;
+    uint16_t lli_last_rollover_queue_len;
+    uint8_t lli_last_rollover_flags;
+    uint8_t lli_last_rollover_prefix_len;
+    uint8_t lli_last_rollover_prefix[8];
+    uint8_t lli_last_segment_reason;
+    uint16_t lli_last_segment_offset;
+    uint16_t lli_last_segment_length;
+    uint8_t lli_last_segment_prefix_len;
+    uint8_t lli_last_segment_prefix[8];
 } uart_dma_idle_diag_t;
 #endif
 #endif  /* CONFIG_UART_SUPPORT_RX */

@@ -18,6 +18,9 @@ static void print_stats(void)
     static uint32_t last_print = 0;
     uint32_t now = (uint32_t)uapi_systick_get_ms();
     uint32_t elapsed_s;
+#if IS_SLE_CLIENT
+    demo_uart_rx_diag_t uart_diag = {0};
+#endif
 
     if (now - last_print < DEMO_STATS_INTERVAL_MS) {
         return;
@@ -43,6 +46,14 @@ static void print_stats(void)
         g_demo_stats.uart_rx_ring_hwm,
         g_demo_stats.uart_tx_ring_hwm,
         g_demo_stats.uart_rx_invalid_bytes);
+#if IS_SLE_CLIENT
+    demo_uart_get_rx_diag(&uart_diag);
+    DEMO_INFO("[UART DMA IDLE] idle_isr=%u raw_cb=%u pub=%u | idle=%u soft=%u dma=%u def=%u/%u last_reason=%u last_len=%u fifo_empty=%u",
+        uart_diag.idle_isr_count, uart_diag.raw_callback_count, uart_diag.publish_count,
+        uart_diag.publish_from_idle_cb, uart_diag.publish_from_soft_flush, uart_diag.publish_from_dma_complete,
+        uart_diag.deferred_publish_set_count, uart_diag.deferred_publish_drained_count,
+        uart_diag.last_publish_reason, uart_diag.last_combined_len, uart_diag.last_rx_fifo_empty);
+#endif
 }
 
 static void *demo_bridge_task(const char *arg)
@@ -88,8 +99,9 @@ static void *demo_bridge_task(const char *arg)
 
     uint32_t work_done = 0;
     while (1) {
+        uint32_t wait_timeout = (work_done > 0U || demo_uart_rx_has_pending_work()) ? 0U : DEMO_EVENT_TIMEOUT_MS;
         (void)osal_event_read(&g_bridge_event, DEMO_EVENT_ALL,
-            work_done > 0U ? 0U : DEMO_EVENT_TIMEOUT_MS,
+            wait_timeout,
             OSAL_WAITMODE_OR | OSAL_WAITMODE_CLR);
 
         work_done = 0;

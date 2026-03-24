@@ -163,7 +163,7 @@ static int radar_demo_init_weakref(void *param) __attribute__ ((weakref("radar_d
 static void at_radar_cmd_register_weakref(void) __attribute__ ((weakref("at_radar_cmd_register")));
 
 #endif
-#ifdef WIFI_TASK_EXIST
+#ifdef APP_WIFI_RUNTIME_ENABLED
 static void at_sys_cmd_register_weakref(void) __attribute__ ((weakref("at_sys_cmd_register")));
 #endif
 
@@ -205,7 +205,7 @@ static const app_task_definition_t g_app_tasks[] = {
     {"at", AT_STACK_SIZE, TASK_PRIORITY_CMD, (osal_kthread_handler)uapi_at_msg_main},
 #endif
 #ifndef DEVICE_BGLE_ALL
-#ifdef WIFI_TASK_EXIST
+#ifdef APP_WIFI_RUNTIME_ENABLED
     /* 栈大小待确认 任务优先级待确认 */
     {"wifi", WIFI_STACK_SIZE, TASK_PRIORITY_WF, (osal_kthread_handler)wifi_host_task},
 #endif
@@ -532,7 +532,7 @@ static void do_at_cmd_register(void)
 #ifdef CONFIG_AT_SUPPORT_PLT
     at_plt_cmd_register();
 #endif
-#ifdef WIFI_TASK_EXIST
+#ifdef APP_WIFI_RUNTIME_ENABLED
     if ((void *)at_sys_cmd_register_weakref != NULL) {
         at_sys_cmd_register_weakref();
     }

@@ -171,6 +171,13 @@ void hal_dma_v151_enable(dma_channel_t ch, bool en)
         hal_dma_ch_cfg_set_ch_en(tmp_dma_ch, (uint32_t)0, tmp_dma_regs);
         dma_port_release_handshaking_source(ch);
         g_hal_dma_channel[ch].state = HAL_DMA_CH_STATE_CLOSED;
+#if defined(CONFIG_DMA_SUPPORT_CIRCULAR_LLI)
+        /* Break circular link before freeing so hal_dma_lli_free terminates */
+        if (g_dma_lli_add[ch] != NULL && g_dma_node_cfg[ch] != NULL &&
+            g_dma_lli_add[ch]->next == g_dma_node_cfg[ch]) {
+            g_dma_lli_add[ch]->next = NULL;
+        }
+#endif
         hal_dma_lli_free(ch);
     }
 }
@@ -477,6 +484,19 @@ static void hal_dma_tc_isr(hal_dma_type_t dma_type)
         if (hal_dma_regs_data_get_int_tc_st(ch, tmp_dma_regs)) {
             real_ch = hal_dma_get_real_channel_num(dma_type, ch);
             hal_dma_interrupt_clear_tc(ch, tmp_dma_regs);
+#if defined(CONFIG_DMA_SUPPORT_CIRCULAR_LLI)
+            /* Circular LLI: DMA keeps running, don't release channel */
+            if (g_dma_node_cfg[real_ch] != NULL &&
+                g_dma_lli_add[real_ch] != NULL &&
+                g_dma_lli_add[real_ch]->next == g_dma_node_cfg[real_ch]) {
+                if (g_hal_dma_channel[real_ch].isr_callback != NULL) {
+                    g_hal_dma_channel[real_ch].isr_callback(
+                        HAL_DMA_INTERRUPT_TFR, real_ch,
+                        g_hal_dma_channel[real_ch].arg);
+                }
+                continue;
+            }
+#endif
             dma_port_release_handshaking_source(real_ch);
             g_hal_dma_channel[real_ch].state = HAL_DMA_CH_STATE_CLOSED;
             if (g_hal_dma_channel[real_ch].isr_callback != NULL) {

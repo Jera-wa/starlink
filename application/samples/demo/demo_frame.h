@@ -146,15 +146,6 @@ static inline uint16_t demo_logical_frame_total_len(const uint8_t *data)
     return (uint16_t)(payload_len + DEMO_LOGICAL_FRAME_HEADER_SIZE);
 }
 
-static inline uint32_t demo_logical_frame_crc32(const uint8_t *data, uint16_t len)
-{
-    if (data == NULL || len == 0U) {
-        return 0U;
-    }
-
-    return uapi_crc32(0U, data, len);
-}
-
 static inline uint8_t demo_sle_calc_frag_count(uint16_t total_len, uint16_t frag_payload)
 {
     uint16_t count;
